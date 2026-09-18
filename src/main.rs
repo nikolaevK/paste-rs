@@ -268,6 +268,12 @@ fn handle_command(cmd: &str, cx: &mut App) {
         "hide" => with_shelf(cx, |s, w, cx| s.hide(w, cx)),
         "toggle" => with_shelf(cx, |s, w, cx| s.toggle(w, cx)),
         "prefs" => ui::prefs::open_prefs(cx),
+        "prefs-tab" => {
+            let n: usize = arg.parse().unwrap_or(0);
+            if let Some(h) = cx.global::<Core>().prefs {
+                let _ = h.update(cx, |p, _, cx| p.debug_set_tab(n, cx));
+            }
+        }
         "preview" => with_shelf(cx, |s, w, cx| s.debug_toggle_preview(w, cx)),
         "dump" => {
             let ax = mac::paste::accessibility_trusted(false);

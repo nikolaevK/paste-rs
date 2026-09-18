@@ -34,9 +34,13 @@ pub struct Prefs {
     tab: PrefsTab,
     recording: bool,
     hotkey_error: Option<SharedString>,
+    /// Pinboard being renamed inline (id, current text).
+    renaming: Option<(i64, String)>,
     focus_handle: FocusHandle,
     scroll: ScrollHandle,
 }
+
+const DEFAULT_HOTKEY: &str = "cmd-shift-v";
 
 pub fn open_prefs(cx: &mut App) {
     if let Some(handle) = cx.global::<Core>().prefs {
@@ -62,7 +66,7 @@ fn open_prefs_window(cx: &mut App) {
     }
     let screen = mac::screen::screen_under_mouse().or_else(|| mac::screen::screens().into_iter().next());
     let (sx, sy, sw, sh) = screen.map(|s| (s.x as f32, s.y as f32, s.width as f32, s.height as f32)).unwrap_or((0., 0., 1440., 900.));
-    let (w, h) = (660.0_f32, 500.0_f32);
+    let (w, h) = (720.0_f32, 540.0_f32);
     let bounds = Bounds::new(point(px(sx + (sw - w) / 2.0), px(sy + (sh - h) / 2.5)), size(px(w), px(h)));
     let result = cx.open_window(
         WindowOptions {
@@ -76,12 +80,12 @@ fn open_prefs_window(cx: &mut App) {
             show: true,
             kind: WindowKind::Normal,
             is_movable: true,
-            is_resizable: false,
+            is_resizable: true,
             is_minimizable: true,
             display_id: None,
             window_background: WindowBackgroundAppearance::Opaque,
             app_id: None,
-            window_min_size: None,
+            window_min_size: Some(size(px(620.), px(420.))),
             window_decorations: None,
             tabbing_identifier: None,
         },
@@ -94,6 +98,7 @@ fn open_prefs_window(cx: &mut App) {
                 tab: PrefsTab::General,
                 recording: false,
                 hotkey_error: None,
+                renaming: None,
                 focus_handle: cx.focus_handle(),
                 scroll: ScrollHandle::new(),
             });
@@ -148,7 +153,43 @@ fn keystroke_string(ks: &Keystroke) -> String {
 }
 
 impl Prefs {
+    pub fn debug_set_tab(&mut self, n: usize, cx: &mut Context<Self>) {
+        if let Some(t) = PrefsTab::ALL.get(n) {
+            self.tab = *t;
+            cx.notify();
+        }
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((id, name)) = &mut self.renaming {
+            let ks = &event.keystroke;
+            match ks.key.as_str() {
+                "escape" => self.renaming = None,
+                "enter" => {
+                    let (id, name) = (*id, name.trim().to_string());
+                    if !name.is_empty() {
+                        let _ = cx.global_mut::<Core>().rename_pinboard(id, &name);
+                    }
+                    self.renaming = None;
+                    cx.refresh_windows();
+                }
+                "backspace" => {
+                    name.pop();
+                }
+                "space" => name.push(' '),
+                _ => {
+                    if !ks.modifiers.platform && !ks.modifiers.control {
+                        if let Some(ch) = &ks.key_char {
+                            if !ch.chars().any(|c| c.is_control()) && name.chars().count() < 40 {
+                                name.push_str(ch);
+                            }
+                        }
+                    }
+                }
+            }
+            cx.notify();
+            return;
+        }
         if !self.recording {
             let ks = &event.keystroke;
             match ks.key.as_str() {
@@ -181,35 +222,12 @@ impl Prefs {
             return;
         }
         let new = keystroke_string(ks);
-        let core = cx.global_mut::<Core>();
-        let result = match core.hotkeys.as_mut() {
-            Some(hk) => hk.set(&new),
-            None => Err(anyhow::anyhow!("hotkeys unavailable")),
-        };
-        match result {
-            Ok(()) => {
-                core.update_settings(|s| s.hotkey = new.clone());
-                let disp = core.hotkey_display();
-                if let Some(t) = &core.tray {
-                    t.set_hotkey_display(&disp);
-                }
-                self.hotkey_error = None;
-                self.recording = false;
-            }
-            Err(e) => {
-                // Restore previous registration.
-                let prev = core.settings().hotkey;
-                if let Some(hk) = core.hotkeys.as_mut() {
-                    let _ = hk.set(&prev);
-                }
-                self.hotkey_error = Some(SharedString::from(format!("Couldn't register: {e}")));
-            }
-        }
-        cx.notify();
+        self.recording = false;
+        self.apply_hotkey(&new, cx);
     }
 
     fn render_sidebar(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
-        let mut side = div().w(px(170.)).h_full().bg(theme.sidebar_bg).p(px(10.)).flex().flex_col().gap(px(2.));
+        let mut side = div().w(px(170.)).flex_shrink_0().h_full().bg(theme.sidebar_bg).p(px(10.)).flex().flex_col().gap(px(2.));
         for (i, t) in PrefsTab::ALL.iter().enumerate() {
             let sel = *t == self.tab;
             let t2 = *t;
@@ -291,6 +309,35 @@ impl Prefs {
                 theme,
             ))
             .child(pref_row(
+                "Clear clipboard history",
+                Some("Removes every item in Clipboard. Pinboards are kept."),
+                button("clear-history", "Clear History…", theme, false).on_click(cx.listener(|_, _, window, cx| {
+                    let answer = window.prompt(
+                        PromptLevel::Warning,
+                        "Clear clipboard history?",
+                        Some("All items in Clipboard will be removed. Pinboards are kept. This can't be undone."),
+                        &["Clear History", "Cancel"],
+                        cx,
+                    );
+                    cx.spawn(async move |_, cx| {
+                        if let Ok(0) = answer.await {
+                            cx.update(|cx| {
+                                if let Err(e) = cx.global_mut::<Core>().clear_history() {
+                                    log::warn!("clear history: {e}");
+                                }
+                                if let Some(shelf) = cx.global::<Core>().shelf {
+                                    let _ = shelf.update(cx, |s, _, cx| s.refresh(cx));
+                                }
+                                cx.refresh_windows();
+                            })
+                            .ok();
+                        }
+                    })
+                    .detach();
+                })),
+                theme,
+            ))
+            .child(pref_row(
                 "Move pasted items to the top",
                 None,
                 toggle("move-top", s.move_pasted_to_top, theme).on_click(cx.listener(|_, _, _, cx| {
@@ -335,8 +382,35 @@ impl Prefs {
             ))
     }
 
+    fn apply_hotkey(&mut self, new: &str, cx: &mut Context<Self>) {
+        let core = cx.global_mut::<Core>();
+        let result = match core.hotkeys.as_mut() {
+            Some(hk) => hk.set(new),
+            None => Err(anyhow::anyhow!("hotkeys unavailable")),
+        };
+        match result {
+            Ok(()) => {
+                core.update_settings(|s| s.hotkey = new.to_string());
+                let disp = core.hotkey_display();
+                if let Some(t) = &core.tray {
+                    t.set_hotkey_display(&disp);
+                }
+                self.hotkey_error = None;
+            }
+            Err(e) => {
+                let prev = core.settings().hotkey;
+                if let Some(hk) = core.hotkeys.as_mut() {
+                    let _ = hk.set(&prev);
+                }
+                self.hotkey_error = Some(SharedString::from(format!("Couldn't register: {e}")));
+            }
+        }
+        cx.notify();
+    }
+
     fn render_shortcuts(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let hotkey = cx.global::<Core>().hotkey_display();
+        let is_default = cx.global::<Core>().settings().hotkey == DEFAULT_HOTKEY;
         let recording = self.recording;
         let rows: &[(&str, &str)] = &[
             ("Paste selected item", "↩"),
@@ -368,6 +442,23 @@ impl Prefs {
                 .gap(px(4.))
                 .child(
                     div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.))
+                        .when(!is_default && !recording, |d| {
+                            d.child(
+                                div()
+                                    .id("hotkey-reset")
+                                    .text_size(px(12.))
+                                    .text_color(theme.accent)
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| this.apply_hotkey(DEFAULT_HOTKEY, cx)))
+                                    .child("Reset to ⌘⇧V"),
+                            )
+                        })
+                        .child(
+                    div()
                         .id("hotkey")
                         .h(px(28.))
                         .min_w(px(120.))
@@ -389,6 +480,7 @@ impl Prefs {
                             cx.notify();
                         }))
                         .child(SharedString::from(if recording { "Press keys…".to_string() } else { hotkey })),
+                        ),
                 )
                 .when_some(self.hotkey_error.clone(), |d, e| d.child(div().text_size(px(11.)).text_color(hsla(0., 0.8, 0.55, 1.)).child(e))),
             theme,
@@ -540,7 +632,45 @@ impl Prefs {
                                 cx.refresh_windows();
                             })),
                     )
-                    .child(div().flex_1().text_size(px(13.)).text_color(theme.text).child(SharedString::from(pb.name.clone())))
+                    .child(match &self.renaming {
+                        Some((rid, text)) if *rid == id => div()
+                            .flex_1()
+                            .h(px(24.))
+                            .px(px(8.))
+                            .rounded(px(6.))
+                            .bg(theme.control_bg)
+                            .border_1()
+                            .border_color(theme.accent)
+                            .flex()
+                            .items_center()
+                            .text_size(px(13.))
+                            .text_color(theme.text)
+                            .child(SharedString::from(text.clone()))
+                            .child(div().w(px(1.5)).h(px(14.)).ml(px(1.)).bg(theme.accent))
+                            .into_any_element(),
+                        _ => {
+                            let name = pb.name.clone();
+                            div()
+                                .id(("pb-name", i))
+                                .flex_1()
+                                .h(px(24.))
+                                .px(px(8.))
+                                .rounded(px(6.))
+                                .flex()
+                                .items_center()
+                                .text_size(px(13.))
+                                .text_color(theme.text)
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme.pill_hover))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.renaming = Some((id, name.clone()));
+                                    window.focus(&this.focus_handle);
+                                    cx.notify();
+                                }))
+                                .child(SharedString::from(pb.name.clone()))
+                                .into_any_element()
+                        }
+                    })
                     .child(div().text_size(px(12.)).text_color(theme.text_tertiary).child(SharedString::from(crate::util::count_label(counts[i] as i64, "item", "items"))))
                     .child(icon_button(("pb-delete", i), "close", 11., theme).on_click(cx.listener(move |_, _, _, cx| {
                         let _ = cx.global_mut::<Core>().delete_pinboard(id);
@@ -548,7 +678,7 @@ impl Prefs {
                     }))),
             );
         }
-        list = list.child(div().pt(px(8.)).text_size(px(11.5)).text_color(theme.text_secondary).child("Click a color dot to change it. Rename pinboards from their tab in the shelf (right-click)."));
+        list = list.child(div().pt(px(8.)).text_size(px(11.5)).text_color(theme.text_secondary).child("Click a name to rename it (↩ to save, Esc to cancel). Click the color dot to change the color."));
         list
     }
 
@@ -628,12 +758,13 @@ impl Render for Prefs {
                 div()
                     .id("prefs-content")
                     .flex_1()
+                    .min_w_0()
                     .h_full()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll)
                     .px(px(22.))
                     .py(px(10.))
-                    .child(content),
+                    .child(content.w_full()),
             )
     }
 }

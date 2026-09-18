@@ -18,7 +18,7 @@ pub fn icon_button(id: impl Into<ElementId>, name: &str, size: f32, theme: &Them
 }
 
 pub fn toggle(id: impl Into<ElementId>, on: bool, theme: &Theme) -> Stateful<Div> {
-    let track = if on { theme.accent } else { theme.control_border.opacity(1.0).blend(theme.control_bg.opacity(0.4)) };
+    let track = if on { theme.accent } else if theme.dark { hsla(0., 0., 0.32, 1.) } else { hsla(0., 0., 0.82, 1.) };
     div()
         .id(id)
         .w(px(38.))
@@ -113,14 +113,22 @@ pub fn pref_row(label: impl Into<SharedString>, description: Option<&str>, contr
         .border_b_1()
         .border_color(theme.separator)
         .child(
+            // The label column takes the remaining width and wraps, so controls always stay visible.
             div()
+                .flex_1()
+                .min_w_0()
                 .flex()
                 .flex_col()
                 .gap(px(2.))
-                .min_w_0()
                 .child(div().text_size(px(13.)).text_color(theme.text).child(label.into()))
                 .when_some(description, |d, desc| {
-                    d.child(div().text_size(px(11.5)).text_color(theme.text_secondary).child(SharedString::from(desc.to_string())))
+                    d.child(
+                        div()
+                            .text_size(px(11.5))
+                            .line_height(px(15.))
+                            .text_color(theme.text_secondary)
+                            .child(SharedString::from(desc.to_string())),
+                    )
                 }),
         )
         .child(div().flex_shrink_0().child(control))
