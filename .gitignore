@@ -1,4 +1,5 @@
 /target
 /dist
-*.png.tmp
+.claude/
 .DS_Store
+*.png.tmp
