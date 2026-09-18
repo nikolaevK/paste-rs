@@ -42,21 +42,88 @@ uses `objc2` bindings to AppKit directly. No Electron, no web view.
 | Delete | `⌘⌫` or `⌦` |
 | Settings / close / quit | `⌘,` / `Esc` `⌘W` / `⌘Q` |
 
-## Build
+## Install from source
 
-Requirements: macOS 13+, Apple Silicon, Rust 1.85+ and Xcode Command Line Tools (a full
-Xcode install is not needed; Metal shaders are compiled at runtime).
+Paste is not distributed as a signed download; you build it yourself in a few minutes.
+
+**Requirements**
+
+- A Mac with Apple Silicon (M1 or later) running macOS 13 or newer.
+- Xcode Command Line Tools. A full Xcode install is not needed (Metal shaders compile at runtime).
+- Rust 1.85 or newer.
+
+**1. Install the tools**
 
 ```sh
-cargo run --release          # run directly (menu bar app, no Dock icon)
-./packaging/build-app.sh     # build dist/Paste.app (ad-hoc signed)
+# Xcode Command Line Tools (skip if `git` already works in Terminal)
+xcode-select --install
+
+# Rust toolchain via rustup, then reload your shell
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+rustc --version   # should print 1.85.0 or newer
+```
+
+**2. Get the code**
+
+```sh
+git clone https://github.com/nikolaevK/paste-rs.git
+cd paste-rs
+```
+
+**3. Build the app bundle**
+
+```sh
+./packaging/build-app.sh
+```
+
+The first build downloads and compiles all dependencies and takes a few minutes; later builds
+take seconds. The script produces `dist/Paste.app`, ad-hoc signed for your machine.
+
+**4. Install and run**
+
+```sh
+cp -R dist/Paste.app /Applications/
+open /Applications/Paste.app
+```
+
+Paste runs as a menu bar app with no Dock icon. Press `⌘⇧V` to open the shelf, or click the
+clipboard icon in the menu bar.
+
+**5. Grant Accessibility access**
+
+On your first paste macOS asks for **Accessibility** access. Grant it in
+System Settings → Privacy & Security → Accessibility (toggle on Paste). Without it Paste still
+copies the selected item to the clipboard but cannot send `⌘V` into the target app.
+
+If you run Paste from the terminal instead (`cargo run --release`), grant the permission to your
+terminal app rather than to Paste.
+
+**Updating**
+
+```sh
+cd paste-rs
+git pull
+./packaging/build-app.sh
 cp -R dist/Paste.app /Applications/
 ```
 
-On first paste macOS asks for **Accessibility** access (System Settings → Privacy & Security →
-Accessibility). Without it Paste still copies the item to the clipboard, but cannot send the
-`⌘V` keystroke into the target app. Grant it to the app you actually run (`Paste.app`, or your
-terminal when using `cargo run`).
+**Uninstalling**
+
+```sh
+rm -rf /Applications/Paste.app
+rm -rf ~/Library/Application\ Support/Paste          # history, images, settings
+rm -f ~/Library/LaunchAgents/io.paste.rs.plist        # only if "Launch at login" was enabled
+```
+
+**Troubleshooting**
+
+- *"Paste.app is damaged" or Gatekeeper refuses to open it* – the bundle is only ad-hoc signed.
+  Run `xattr -dr com.apple.quarantine /Applications/Paste.app` once, or build it locally as above.
+- *Nothing pastes, the item is only copied* – Accessibility access is missing (see step 5).
+- *`⌘⇧V` does nothing* – another app owns that shortcut. Change it in Settings → Shortcuts
+  (menu bar icon → Settings…).
+- *Build fails with a Rust version error* – run `rustup update`.
 
 ## Tests
 
