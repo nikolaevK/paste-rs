@@ -760,6 +760,9 @@ impl Shelf {
     // ---------- keyboard ----------
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // The shelf consumes every key. Marking the event handled stops gpui from re-dispatching
+        // it through the text-input path (which would run this handler a second time).
+        cx.stop_propagation();
         let ks = &event.keystroke;
         let m = ks.modifiers;
         let key = ks.key.as_str();

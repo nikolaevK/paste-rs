@@ -304,6 +304,15 @@ fn handle_command(cmd: &str, cx: &mut App) {
             })
             .detach();
         }
+        "press" => {
+            // Real AppKit key event (keyDown + keyUp) to the key window: `press right`, `press cmd-a`.
+            let parts: Vec<&str> = arg.split('-').collect();
+            let (mods, key) = parts.split_last().map(|(k, m)| (m.to_vec(), *k)).unwrap_or((vec![], arg));
+            let key = key.to_string();
+            let cmd = mods.contains(&"cmd");
+            let shift = mods.contains(&"shift");
+            cx.spawn(async move |_| mac::window::synthesize_key_press(&key, cmd, shift)).detach();
+        }
         "key" => match gpui::Keystroke::parse(arg) {
             Ok(mut ks) => {
                 if ks.key_char.is_none() && ks.key.chars().count() == 1 && !ks.modifiers.platform && !ks.modifiers.control {

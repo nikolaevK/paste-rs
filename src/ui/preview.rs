@@ -92,6 +92,7 @@ impl Preview {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
         match event.keystroke.key.as_str() {
             "escape" | "space" => self.close(false, window, cx),
             "enter" => self.close(true, window, cx),

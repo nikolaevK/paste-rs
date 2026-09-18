@@ -81,6 +81,70 @@ pub fn capture_png(win: &NSWindow, path: &std::path::Path) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Synthesizes a real key press (down + up) through AppKit's event path, for testing.
+/// `key` is a single character or one of: left, right, up, down, escape, enter, space, tab, backspace.
+pub fn synthesize_key_press(key: &str, cmd: bool, shift: bool) {
+    use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
+    use objc2_foundation::NSString;
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let (code, chars, function): (u16, String, bool) = match key {
+        "left" => (123, "\u{F702}".into(), true),
+        "right" => (124, "\u{F703}".into(), true),
+        "down" => (125, "\u{F701}".into(), true),
+        "up" => (126, "\u{F700}".into(), true),
+        "escape" => (53, "\u{1b}".into(), false),
+        "enter" => (36, "\r".into(), false),
+        "space" => (49, " ".into(), false),
+        "tab" => (48, "\t".into(), false),
+        "backspace" => (51, "\u{7f}".into(), false),
+        k => {
+            let ch = k.chars().next().unwrap_or('a');
+            let code = match ch.to_ascii_lowercase() {
+                'a' => 0, 's' => 1, 'd' => 2, 'f' => 3, 'h' => 4, 'g' => 5, 'z' => 6, 'x' => 7, 'c' => 8, 'v' => 9,
+                'b' => 11, 'q' => 12, 'w' => 13, 'e' => 14, 'r' => 15, 'y' => 16, 't' => 17, '1' => 18, '2' => 19,
+                '3' => 20, '4' => 21, '6' => 22, '5' => 23, '9' => 25, '7' => 26, '8' => 28, '0' => 29, 'o' => 31,
+                'u' => 32, 'i' => 34, 'p' => 35, 'l' => 37, 'j' => 38, 'k' => 40, 'n' => 45, 'm' => 46, _ => 0,
+            };
+            (code, ch.to_string(), false)
+        }
+    };
+    let mut flags = NSEventModifierFlags::empty();
+    if function {
+        flags |= NSEventModifierFlags::Function | NSEventModifierFlags::NumericPad;
+    }
+    if cmd {
+        flags |= NSEventModifierFlags::Command;
+    }
+    if shift {
+        flags |= NSEventModifierFlags::Shift;
+    }
+    let app = NSApplication::sharedApplication(mtm);
+    let Some(win) = app.keyWindow() else {
+        log::warn!("press: no key window");
+        return;
+    };
+    let ns_chars = NSString::from_str(&chars);
+    for ty in [NSEventType::KeyDown, NSEventType::KeyUp] {
+        let ev = unsafe {
+            NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
+                ty,
+                NSPoint::new(0.0, 0.0),
+                flags,
+                0.0,
+                win.windowNumber(),
+                None,
+                &ns_chars,
+                &ns_chars,
+                false,
+                code,
+            )
+        };
+        if let Some(ev) = ev {
+            win.sendEvent(&ev);
+        }
+    }
+}
+
 pub fn set_accessory_policy() {
     if let Some(mtm) = MainThreadMarker::new() {
         let app = NSApplication::sharedApplication(mtm);

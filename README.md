@@ -135,7 +135,7 @@ cargo test
 
 Paste listens on a local Unix socket at `~/Library/Application Support/Paste/control.sock`.
 One command per line: `show`, `hide`, `toggle`, `prefs`, `preview`, `dump`, `quit`,
-`key <keystroke>` (e.g. `key cmd-1`), `shot <prefix>` (saves PNGs of the open windows).
+`key <keystroke>` (e.g. `key cmd-1`), `press <key>` (a real AppKit key event, e.g. `press right`), `prefs-tab <n>`, `shot <prefix>` (saves PNGs of the open windows).
 
 ```sh
 echo toggle | nc -U ~/Library/Application\ Support/Paste/control.sock

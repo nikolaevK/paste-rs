@@ -161,6 +161,9 @@ impl Prefs {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.renaming.is_some() || self.recording {
+            cx.stop_propagation();
+        }
         if let Some((id, name)) = &mut self.renaming {
             let ks = &event.keystroke;
             match ks.key.as_str() {
@@ -194,10 +197,12 @@ impl Prefs {
             let ks = &event.keystroke;
             match ks.key.as_str() {
                 "w" if ks.modifiers.platform => {
+                    cx.stop_propagation();
                     cx.global_mut::<Core>().prefs = None;
                     window.remove_window();
                 }
                 "escape" => {
+                    cx.stop_propagation();
                     cx.global_mut::<Core>().prefs = None;
                     window.remove_window();
                 }
