@@ -10,6 +10,7 @@ pub const CARD_H: f32 = 228.0;
 pub const CARD_GAP: f32 = 14.0;
 pub const HEADER_H: f32 = 44.0;
 pub const FOOTER_H: f32 = 24.0;
+pub const CARD_RADIUS: f32 = 12.0;
 
 pub fn app_icon_view(app_icon: &AppIcon, size: f32) -> AnyElement {
     match &app_icon.path {
@@ -242,6 +243,7 @@ pub fn render_card(
     let header = div()
         .h(px(HEADER_H))
         .flex_shrink_0()
+        .rounded_t(px(CARD_RADIUS))
         .bg(tint)
         .px(px(12.))
         .flex()
@@ -278,6 +280,7 @@ pub fn render_card(
     let footer = div()
         .h(px(FOOTER_H))
         .flex_shrink_0()
+        .rounded_b(px(CARD_RADIUS))
         .px(px(10.))
         .flex()
         .items_center()
@@ -286,18 +289,35 @@ pub fn render_card(
         .text_color(theme.text_tertiary)
         .child(div().truncate().child(SharedString::from(caption(item))));
 
-    let mut shadows = vec![BoxShadow {
-        color: theme.shadow,
-        offset: point(px(0.), px(if hovered { 4. } else { 1. })),
-        blur_radius: px(if hovered { 14. } else { 4. }),
-        spread_radius: px(0.),
-    }];
-    if selected {
-        shadows.push(BoxShadow {
-            color: theme.accent.opacity(0.35),
+    // No border: a soft drop shadow separates the card from the shelf, and a hairline ring keeps
+    // it crisp on dark backgrounds. Selection draws a solid accent ring outside the card, so the
+    // header and body always reach the card's rounded edge.
+    let mut shadows = vec![
+        BoxShadow {
+            color: theme.card_border,
             offset: point(px(0.), px(0.)),
             blur_radius: px(0.),
-            spread_radius: px(3.),
+            spread_radius: px(0.5),
+        },
+        BoxShadow {
+            color: theme.shadow,
+            offset: point(px(0.), px(if hovered { 5. } else { 2. })),
+            blur_radius: px(if hovered { 16. } else { 6. }),
+            spread_radius: px(0.),
+        },
+    ];
+    if selected {
+        shadows.push(BoxShadow {
+            color: theme.accent,
+            offset: point(px(0.), px(0.)),
+            blur_radius: px(0.),
+            spread_radius: px(2.5),
+        });
+        shadows.push(BoxShadow {
+            color: theme.accent.opacity(0.25),
+            offset: point(px(0.), px(0.)),
+            blur_radius: px(0.),
+            spread_radius: px(5.),
         });
     }
 
@@ -308,11 +328,9 @@ pub fn render_card(
         .flex_shrink_0()
         .flex()
         .flex_col()
-        .rounded(px(12.))
+        .rounded(px(CARD_RADIUS))
         .overflow_hidden()
         .bg(theme.card_bg)
-        .border_2()
-        .border_color(if selected { theme.accent } else { theme.card_border })
         .shadow(shadows)
         .cursor_pointer()
         .child(header)
