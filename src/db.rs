@@ -2,12 +2,14 @@ use crate::model::{ClipItem, ItemKind, NewItem, Payload, Pinboard, make_preview}
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
 }
+
+const SCHEMA_VERSION: i64 = 2;
 
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -39,6 +41,7 @@ CREATE TABLE IF NOT EXISTS items (
     image_path TEXT,
     thumb_path TEXT,
     favicon_path TEXT,
+    link_image_path TEXT,
     files TEXT,
     app_bundle TEXT NOT NULL DEFAULT '',
     app_name TEXT NOT NULL DEFAULT '',
@@ -54,6 +57,9 @@ CREATE TABLE IF NOT EXISTS items (
 
 CREATE INDEX IF NOT EXISTS items_created ON items(pinboard_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS items_hash ON items(hash);
+CREATE INDEX IF NOT EXISTS items_image_path ON items(image_path);
+CREATE INDEX IF NOT EXISTS items_thumb_path ON items(thumb_path);
+CREATE INDEX IF NOT EXISTS items_link_image_path ON items(link_image_path);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
     text, title, app_name,
@@ -77,6 +83,92 @@ CREATE TRIGGER IF NOT EXISTS items_au AFTER UPDATE OF text, title, app_name ON i
 END;
 "#;
 
+/// Numbered, transactional schema migrations keyed by `PRAGMA user_version`.
+fn migrate(conn: &Connection) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version >= SCHEMA_VERSION {
+        return Ok(());
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<()> {
+        if version < 2 {
+            let mut stmt = conn.prepare("PRAGMA table_info(items)")?;
+            let cols: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(1))?.filter_map(|r| r.ok()).collect();
+            drop(stmt);
+            if !cols.iter().any(|c| c == "link_image_path") {
+                conn.execute("ALTER TABLE items ADD COLUMN link_image_path TEXT", [])?;
+            }
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS items_image_path ON items(image_path);
+                 CREATE INDEX IF NOT EXISTS items_thumb_path ON items(thumb_path);
+                 CREATE INDEX IF NOT EXISTS items_link_image_path ON items(link_image_path);",
+            )?;
+        }
+        conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+const PATH_COLS: [&str; 3] = ["image_path", "thumb_path", "link_image_path"];
+
+/// Deletes rows in one transaction and returns files no surviving row references.
+fn delete_rows(conn: &Connection, ids: &[i64]) -> Result<Vec<PathBuf>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<Vec<PathBuf>> {
+        let mut candidates: Vec<String> = Vec::new();
+        {
+            let mut stmt = conn.prepare("SELECT image_path, thumb_path, link_image_path FROM items WHERE id = ?1")?;
+            let mut del = conn.prepare("DELETE FROM items WHERE id = ?1")?;
+            for id in ids {
+                let row: Option<(Option<String>, Option<String>, Option<String>)> =
+                    stmt.query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
+                if let Some((a, b, c)) = row {
+                    candidates.extend([a, b, c].into_iter().flatten());
+                }
+                del.execute([id])?;
+            }
+        }
+        candidates.sort();
+        candidates.dedup();
+        let mut orphans = Vec::new();
+        for path in candidates {
+            let mut referenced = false;
+            for col in PATH_COLS {
+                let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM items WHERE {col} = ?1"), [&path], |r| r.get(0))?;
+                if n > 0 {
+                    referenced = true;
+                    break;
+                }
+            }
+            if !referenced {
+                orphans.push(PathBuf::from(path));
+            }
+        }
+        Ok(orphans)
+    })();
+    match result {
+        Ok(orphans) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(orphans)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
 fn row_to_item(row: &Row) -> rusqlite::Result<ClipItem> {
     let kind: String = row.get("kind")?;
     let text: String = row.get("text")?;
@@ -96,6 +188,7 @@ fn row_to_item(row: &Row) -> rusqlite::Result<ClipItem> {
         image_path: row.get::<_, Option<String>>("image_path")?.map(PathBuf::from),
         thumb_path: row.get::<_, Option<String>>("thumb_path")?.map(PathBuf::from),
         favicon_path: row.get::<_, Option<String>>("favicon_path")?.map(PathBuf::from),
+        link_image_path: row.get::<_, Option<String>>("link_image_path")?.map(PathBuf::from),
         files,
         app_bundle: row.get("app_bundle")?,
         app_name: row.get("app_name")?,
@@ -109,12 +202,38 @@ fn row_to_item(row: &Row) -> rusqlite::Result<ClipItem> {
     })
 }
 
-const ITEM_COLS: &str = "id, kind, substr(text, 1, 2400) AS text, title, color, image_path, thumb_path, favicon_path, files, app_bundle, app_name, created_at, char_count, width, height, byte_size, pinboard_id, hash";
+const ITEM_COLS: &str = "id, kind, substr(text, 1, 2400) AS text, title, color, image_path, thumb_path, favicon_path, link_image_path, files, app_bundle, app_name, created_at, char_count, width, height, byte_size, pinboard_id, hash";
 
 impl Db {
+    fn lock(&self) -> MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn delete_ids(&self, ids: &[i64]) -> Result<()> {
+        let orphans = {
+            let conn = self.lock();
+            delete_rows(&conn, ids)?
+        };
+        for p in orphans {
+            let _ = std::fs::remove_file(p);
+        }
+        Ok(())
+    }
+
+    fn ids_where(&self, sql: &str, param: Option<i64>) -> Result<Vec<i64>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(sql)?;
+        let rows = match param {
+            Some(p) => stmt.query_map([p], |r| r.get::<_, i64>(0))?.filter_map(|r| r.ok()).collect(),
+            None => stmt.query_map([], |r| r.get::<_, i64>(0))?.filter_map(|r| r.ok()).collect(),
+        };
+        Ok(rows)
+    }
+
     pub fn open(path: PathBuf) -> Result<Db> {
         let conn = Connection::open(&path).with_context(|| format!("open {}", path.display()))?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Db { conn: Arc::new(Mutex::new(conn)) })
     }
 
@@ -122,11 +241,12 @@ impl Db {
     pub fn open_in_memory() -> Result<Db> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Db { conn: Arc::new(Mutex::new(conn)) })
     }
 
     pub fn insert(&self, item: &NewItem) -> Result<ClipItem> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         let files = if item.files.is_empty() {
             None
         } else {
@@ -167,6 +287,7 @@ impl Db {
             image_path: item.image_path.clone(),
             thumb_path: item.thumb_path.clone(),
             favicon_path: None,
+            link_image_path: None,
             files: item.files.clone(),
             app_bundle: item.app_bundle.clone(),
             app_name: item.app_name.clone(),
@@ -182,7 +303,7 @@ impl Db {
 
     /// All history items (not pinned), newest first.
     pub fn history(&self) -> Result<Vec<ClipItem>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         let mut stmt = conn.prepare(&format!(
             "SELECT {ITEM_COLS} FROM items WHERE pinboard_id IS NULL ORDER BY created_at DESC, id DESC"
         ))?;
@@ -191,7 +312,7 @@ impl Db {
     }
 
     pub fn pinboard_items(&self, pinboard_id: i64) -> Result<Vec<ClipItem>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         let mut stmt = conn.prepare(&format!(
             "SELECT {ITEM_COLS} FROM items WHERE pinboard_id = ?1 ORDER BY position ASC, created_at DESC"
         ))?;
@@ -200,14 +321,14 @@ impl Db {
     }
 
     pub fn get(&self, id: i64) -> Result<Option<ClipItem>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         Ok(conn
             .query_row(&format!("SELECT {ITEM_COLS} FROM items WHERE id = ?1"), [id], row_to_item)
             .optional()?)
     }
 
     pub fn payload(&self, id: i64) -> Result<Payload> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         Ok(conn.query_row(
             "SELECT text, rtf, html FROM items WHERE id = ?1",
             [id],
@@ -231,14 +352,14 @@ impl Db {
             return Ok(Vec::new());
         }
         let expr = tokens.join(" ");
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT rowid FROM items_fts WHERE items_fts MATCH ?1")?;
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT rowid FROM items_fts WHERE items_fts MATCH ?1 ORDER BY bm25(items_fts) LIMIT 20000")?;
         let rows = stmt.query_map([expr], |r| r.get::<_, i64>(0))?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     pub fn find_recent_by_hash(&self, hash: &str) -> Result<Option<i64>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         Ok(conn
             .query_row(
                 "SELECT id FROM items WHERE hash = ?1 AND pinboard_id IS NULL ORDER BY created_at DESC LIMIT 1",
@@ -250,65 +371,41 @@ impl Db {
 
     /// Moves an item to the top of the history by refreshing its timestamp.
     pub fn touch(&self, id: i64) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         let now = now_ms();
         conn.execute("UPDATE items SET created_at = ?1 WHERE id = ?2", params![now, id])?;
         Ok(now)
     }
 
     pub fn delete(&self, id: i64) -> Result<()> {
-        let paths = self.orphan_paths(id)?;
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM items WHERE id = ?1", [id])?;
-        drop(conn);
-        for p in paths {
-            let _ = std::fs::remove_file(p);
-        }
-        Ok(())
+        self.delete_ids(&[id])
     }
 
-    /// Image files that are only referenced by this item.
-    fn orphan_paths(&self, id: i64) -> Result<Vec<PathBuf>> {
-        let conn = self.conn.lock().unwrap();
-        let mut out = Vec::new();
-        for col in ["image_path", "thumb_path"] {
-            let path: Option<String> = conn
-                .query_row(&format!("SELECT {col} FROM items WHERE id = ?1"), [id], |r| r.get(0))
-                .optional()?
-                .flatten();
-            if let Some(path) = path {
-                let refs: i64 = conn.query_row(
-                    &format!("SELECT COUNT(*) FROM items WHERE {col} = ?1"),
-                    [&path],
-                    |r| r.get(0),
-                )?;
-                if refs <= 1 {
-                    out.push(PathBuf::from(path));
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    pub fn update_link_meta(&self, id: i64, title: Option<&str>, favicon: Option<&PathBuf>) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+    pub fn update_link_meta(&self, id: i64, title: Option<&str>, favicon: Option<&PathBuf>, image: Option<&PathBuf>) -> Result<()> {
+        let conn = self.lock();
         conn.execute(
-            "UPDATE items SET title = COALESCE(?1, title), favicon_path = COALESCE(?2, favicon_path) WHERE id = ?3 OR (hash = (SELECT hash FROM items WHERE id = ?3))",
-            params![title, favicon.map(|p| p.to_string_lossy().to_string()), id],
+            "UPDATE items SET title = COALESCE(?1, title), favicon_path = COALESCE(?2, favicon_path), link_image_path = COALESCE(?3, link_image_path)
+             WHERE kind = 'link' AND (id = ?4 OR hash = (SELECT hash FROM items WHERE id = ?4))",
+            params![
+                title,
+                favicon.map(|p| p.to_string_lossy().to_string()),
+                image.map(|p| p.to_string_lossy().to_string()),
+                id
+            ],
         )?;
         Ok(())
     }
 
     pub fn copy_to_pinboard(&self, id: i64, pinboard_id: i64) -> Result<ClipItem> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         let pos: i64 = conn.query_row(
             "SELECT COALESCE(MIN(position), 1) - 1 FROM items WHERE pinboard_id = ?1",
             [pinboard_id],
             |r| r.get(0),
         )?;
         conn.execute(
-            "INSERT INTO items (kind, text, rtf, html, title, color, image_path, thumb_path, favicon_path, files, app_bundle, app_name, created_at, char_count, width, height, byte_size, hash, pinboard_id, position)
-             SELECT kind, text, rtf, html, title, color, image_path, thumb_path, favicon_path, files, app_bundle, app_name, created_at, char_count, width, height, byte_size, hash, ?2, ?3 FROM items WHERE id = ?1",
+            "INSERT INTO items (kind, text, rtf, html, title, color, image_path, thumb_path, favicon_path, link_image_path, files, app_bundle, app_name, created_at, char_count, width, height, byte_size, hash, pinboard_id, position)
+             SELECT kind, text, rtf, html, title, color, image_path, thumb_path, favicon_path, link_image_path, files, app_bundle, app_name, created_at, char_count, width, height, byte_size, hash, ?2, ?3 FROM items WHERE id = ?1",
             params![id, pinboard_id, pos],
         )?;
         let new_id = conn.last_insert_rowid();
@@ -317,7 +414,7 @@ impl Db {
     }
 
     pub fn pinboards(&self) -> Result<Vec<Pinboard>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         let mut stmt = conn.prepare("SELECT id, name, color, position FROM pinboards ORDER BY position ASC, id ASC")?;
         let rows = stmt.query_map([], |r| {
             Ok(Pinboard { id: r.get(0)?, name: r.get(1)?, color: r.get(2)?, position: r.get(3)? })
@@ -326,7 +423,7 @@ impl Db {
     }
 
     pub fn create_pinboard(&self, name: &str, color: &str) -> Result<Pinboard> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         let pos: i64 = conn.query_row("SELECT COALESCE(MAX(position), 0) + 1 FROM pinboards", [], |r| r.get(0))?;
         conn.execute(
             "INSERT INTO pinboards (name, color, position) VALUES (?1, ?2, ?3)",
@@ -336,57 +433,40 @@ impl Db {
     }
 
     pub fn rename_pinboard(&self, id: i64, name: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         conn.execute("UPDATE pinboards SET name = ?1 WHERE id = ?2", params![name, id])?;
         Ok(())
     }
 
     pub fn recolor_pinboard(&self, id: i64, color: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         conn.execute("UPDATE pinboards SET color = ?1 WHERE id = ?2", params![color, id])?;
         Ok(())
     }
 
     pub fn delete_pinboard(&self, id: i64) -> Result<()> {
-        let ids: Vec<i64> = {
-            let conn = self.conn.lock().unwrap();
-            let mut stmt = conn.prepare("SELECT id FROM items WHERE pinboard_id = ?1")?;
-            let rows = stmt.query_map([id], |r| r.get(0))?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
-        for item in ids {
-            let _ = self.delete(item);
-        }
-        let conn = self.conn.lock().unwrap();
+        let ids = self.ids_where("SELECT id FROM items WHERE pinboard_id = ?1", Some(id))?;
+        self.delete_ids(&ids)?;
+        let conn = self.lock();
         conn.execute("DELETE FROM pinboards WHERE id = ?1", [id])?;
         Ok(())
     }
 
     pub fn clear_history(&self) -> Result<()> {
-        let ids: Vec<i64> = {
-            let conn = self.conn.lock().unwrap();
-            let mut stmt = conn.prepare("SELECT id FROM items WHERE pinboard_id IS NULL")?;
-            let rows = stmt.query_map([], |r| r.get(0))?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
-        for id in ids {
-            let _ = self.delete(id);
-        }
-        Ok(())
+        let ids = self.ids_where("SELECT id FROM items WHERE pinboard_id IS NULL", None)?;
+        self.delete_ids(&ids)
     }
 
     pub fn purge_older_than(&self, cutoff_ms: i64) -> Result<usize> {
-        let ids: Vec<i64> = {
-            let conn = self.conn.lock().unwrap();
-            let mut stmt = conn.prepare("SELECT id FROM items WHERE pinboard_id IS NULL AND created_at < ?1")?;
-            let rows = stmt.query_map([cutoff_ms], |r| r.get(0))?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
-        let n = ids.len();
-        for id in ids {
-            let _ = self.delete(id);
-        }
-        Ok(n)
+        let ids = self.ids_where("SELECT id FROM items WHERE pinboard_id IS NULL AND created_at < ?1", Some(cutoff_ms))?;
+        self.delete_ids(&ids)?;
+        Ok(ids.len())
+    }
+
+    /// WAL housekeeping; cheap when there is nothing to do.
+    pub fn checkpoint(&self) {
+        let conn = self.lock();
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
     }
 }
 

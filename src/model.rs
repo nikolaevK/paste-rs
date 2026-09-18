@@ -57,6 +57,7 @@ pub struct ClipItem {
     pub image_path: Option<PathBuf>,
     pub thumb_path: Option<PathBuf>,
     pub favicon_path: Option<PathBuf>,
+    pub link_image_path: Option<PathBuf>,
     pub files: Vec<PathBuf>,
     pub app_bundle: String,
     pub app_name: String,

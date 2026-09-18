@@ -15,10 +15,18 @@ pub struct Preview {
     app_icon: AppIcon,
     focus_handle: FocusHandle,
     scroll: ScrollHandle,
+    closing: bool,
 }
 
+/// Very long texts are cut for the preview; laying out megabytes of text would stall the UI.
+const PREVIEW_TEXT_CHARS: usize = 200_000;
+
 pub fn open_preview(item: Arc<ClipItem>, app_icon: AppIcon, cx: &mut App) -> anyhow::Result<WindowHandle<Preview>> {
-    let payload = cx.global::<Core>().db.payload(item.id).unwrap_or_default();
+    let mut payload = cx.global::<Core>().db.payload(item.id).unwrap_or_default();
+    if payload.text.chars().count() > PREVIEW_TEXT_CHARS {
+        let cut: String = payload.text.chars().take(PREVIEW_TEXT_CHARS).collect();
+        payload.text = format!("{cut}\n\n… (truncated for preview)");
+    }
     let screen = mac::screen::screen_under_mouse().or_else(|| mac::screen::screens().into_iter().next());
     let (sx, sy, sw, sh) = screen.map(|s| (s.x as f32, s.y as f32, s.width as f32, s.height as f32)).unwrap_or((0., 0., 1440., 900.));
     let w = (sw * 0.6).clamp(480., 1100.);
@@ -44,12 +52,21 @@ pub fn open_preview(item: Arc<ClipItem>, app_icon: AppIcon, cx: &mut App) -> any
             tabbing_identifier: None,
         },
         |window, cx| {
-            let view = cx.new(|cx| Preview {
-                item,
-                payload,
-                app_icon,
-                focus_handle: cx.focus_handle(),
-                scroll: ScrollHandle::new(),
+            let view = cx.new(|cx| {
+                cx.observe_window_activation(window, |this: &mut Preview, window, cx| {
+                    if !window.is_window_active() && !this.closing {
+                        this.close(false, window, cx);
+                    }
+                })
+                .detach();
+                Preview {
+                    item,
+                    payload,
+                    app_icon,
+                    focus_handle: cx.focus_handle(),
+                    scroll: ScrollHandle::new(),
+                    closing: false,
+                }
             });
             let handle = view.read(cx).focus_handle.clone();
             window.focus(&handle);
@@ -61,6 +78,10 @@ pub fn open_preview(item: Arc<ClipItem>, app_icon: AppIcon, cx: &mut App) -> any
 
 impl Preview {
     fn close(&mut self, paste: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
+        self.closing = true;
         window.remove_window();
         let shelf = cx.global::<Core>().shelf;
         cx.defer(move |cx| {
@@ -87,13 +108,21 @@ impl Preview {
         match item.kind {
             ItemKind::Image => {
                 let path = item.image_path.clone().or_else(|| item.thumb_path.clone());
+                let t = *theme;
                 div()
                     .size_full()
                     .flex()
                     .items_center()
                     .justify_center()
                     .p(px(16.))
-                    .children(path.map(|p| img(p).max_w_full().max_h_full().object_fit(ObjectFit::Contain).rounded(px(6.))))
+                    .children(path.map(|p| {
+                        img(p)
+                            .max_w_full()
+                            .max_h_full()
+                            .object_fit(ObjectFit::Contain)
+                            .rounded(px(6.))
+                            .with_loading(move || div().size(px(160.)).child(crate::ui::card::image_placeholder(&t, "image", true)).into_any_element())
+                    }))
                     .into_any_element()
             }
             ItemKind::Color => {
@@ -147,6 +176,15 @@ impl Preview {
                 .flex()
                 .flex_col()
                 .gap(px(12.))
+                .children(item.link_image_path.clone().map(|p| {
+                    let t = *theme;
+                    div().h(px(260.)).w_full().flex_shrink_0().rounded(px(10.)).overflow_hidden().child(
+                        img(p)
+                            .size_full()
+                            .object_fit(ObjectFit::Cover)
+                            .with_loading(move || crate::ui::card::image_placeholder(&t, "image", true)),
+                    )
+                }))
                 .child(
                     div()
                         .flex()

@@ -16,8 +16,8 @@ pub enum MonitorEvent {
     New(crate::model::ClipItem),
     /// An existing history item was copied again and moved to the top.
     Touched { id: i64, created_at: i64 },
-    /// Link metadata arrived for an item.
-    LinkMeta { id: i64, title: Option<String>, favicon: Option<PathBuf> },
+    /// Link metadata fetch finished for an item (fields may all be None).
+    LinkMeta { id: i64, title: Option<String>, favicon: Option<PathBuf>, image: Option<PathBuf> },
 }
 
 pub struct MonitorHandle {
@@ -51,12 +51,16 @@ pub fn spawn(db: Db, settings: Arc<RwLock<Settings>>, tx: UnboundedSender<Monito
                 if own_change.load(Ordering::Relaxed) == count {
                     continue;
                 }
-                let front = workspace::frontmost_app();
-                let snapshot = pasteboard::read();
-                let settings_snapshot = settings.read().unwrap().clone();
-                if let Err(e) = handle_snapshot(&db, &settings_snapshot, snapshot, front, &tx) {
-                    log::warn!("clipboard capture failed: {e}");
-                }
+                // Each iteration gets its own autorelease pool: AppKit autoreleases plenty of
+                // temporaries here and a background thread has no pool of its own.
+                objc2::rc::autoreleasepool(|_| {
+                    let front = workspace::frontmost_app();
+                    let snapshot = pasteboard::read();
+                    let settings_snapshot = settings.read().unwrap_or_else(|p| p.into_inner()).clone();
+                    if let Err(e) = handle_snapshot(&db, &settings_snapshot, snapshot, front, &tx) {
+                        log::warn!("clipboard capture failed: {e}");
+                    }
+                });
             }
         })
         .expect("spawn clipboard monitor");
@@ -137,12 +141,12 @@ fn handle_snapshot(
             let stored = store_image(&data, is_png, &hash)?;
             NewItem {
                 kind: ItemKind::Image,
-                text: format!("Image {}×{}", stored.width, stored.height),
+                text: if stored.width > 0 { format!("Image {}×{}", stored.width, stored.height) } else { "Image".to_string() },
                 rtf: None,
                 html: None,
                 color: None,
                 image_path: Some(stored.image_path),
-                thumb_path: Some(stored.thumb_path),
+                thumb_path: stored.thumb_path,
                 files: vec![],
                 app_bundle,
                 app_name,
@@ -154,6 +158,11 @@ fn handle_snapshot(
             }
         }
         Content::Files(files) => {
+            // Only keep files that actually exist; a copy of nothing is not worth a card.
+            let files: Vec<PathBuf> = files.into_iter().filter(|p| p.exists()).collect();
+            if files.is_empty() {
+                return Ok(());
+            }
             let joined = files.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>().join("\n");
             let hash = util::hash_bytes(joined.as_bytes());
             let size: u64 = files.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
@@ -193,49 +202,80 @@ fn handle_snapshot(
 
     if is_link && settings.fetch_link_previews {
         let db = db.clone();
-        let tx = tx.clone();
-        std::thread::Builder::new()
-            .name("link-preview".into())
-            .spawn(move || {
-                if let Some(meta) = crate::link_preview::fetch(&url) {
-                    let _ = db.update_link_meta(id, meta.title.as_deref(), meta.favicon.as_ref());
-                    let _ = tx.unbounded_send(MonitorEvent::LinkMeta { id, title: meta.title, favicon: meta.favicon });
-                }
-            })
-            .ok();
+        let tx_done = tx.clone();
+        let queued = crate::link_preview::enqueue(url, move |meta| {
+            if meta.title.is_some() || meta.favicon.is_some() || meta.image.is_some() {
+                let _ = db.update_link_meta(id, meta.title.as_deref(), meta.favicon.as_ref(), meta.image.as_ref());
+            }
+            let _ = tx_done.unbounded_send(MonitorEvent::LinkMeta { id, title: meta.title, favicon: meta.favicon, image: meta.image });
+        });
+        if !queued {
+            let _ = tx.unbounded_send(MonitorEvent::LinkMeta { id, title: None, favicon: None, image: None });
+        }
     }
     Ok(())
 }
 
 pub struct StoredImage {
     pub image_path: PathBuf,
-    pub thumb_path: PathBuf,
+    /// None when the image could not be decoded for a thumbnail (the card shows a placeholder).
+    pub thumb_path: Option<PathBuf>,
     pub width: u32,
     pub height: u32,
     pub byte_size: usize,
 }
 
 const THUMB_MAX: u32 = 480;
+/// Above this many pixels we keep the file but skip decoding for a thumbnail.
+const MAX_THUMB_PIXELS: u64 = 60_000_000;
 
 pub fn store_image(data: &[u8], is_png: bool, hash: &str) -> anyhow::Result<StoredImage> {
     let dir = data_dir();
     let image_path = dir.join("images").join(format!("{hash}.png"));
     let thumb_path = dir.join("thumbs").join(format!("{hash}.png"));
-    let img = image::load_from_memory(data)?;
-    let (width, height) = (img.width(), img.height());
-    if is_png {
-        std::fs::write(&image_path, data)?;
+
+    // Normalise to PNG. AppKit handles every TIFF variant (CMYK, planar, JPEG-compressed) that
+    // the pure-Rust decoder may reject.
+    let png: std::borrow::Cow<[u8]> = if is_png {
+        std::borrow::Cow::Borrowed(data)
+    } else if let Some(converted) = workspace::data_to_png(data) {
+        std::borrow::Cow::Owned(converted)
     } else {
-        img.save_with_format(&image_path, image::ImageFormat::Png)?;
-    }
-    let byte_size = std::fs::metadata(&image_path).map(|m| m.len() as usize).unwrap_or(data.len());
-    let thumb = if width > THUMB_MAX || height > THUMB_MAX {
-        img.thumbnail(THUMB_MAX, THUMB_MAX)
-    } else {
-        img
+        let img = image::load_from_memory(data)?;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png)?;
+        std::borrow::Cow::Owned(buf.into_inner())
     };
-    thumb.save_with_format(&thumb_path, image::ImageFormat::Png)?;
-    Ok(StoredImage { image_path, thumb_path, width, height, byte_size })
+    std::fs::write(&image_path, &png)?;
+    let byte_size = png.len();
+
+    let (mut width, mut height) = (0u32, 0u32);
+    let mut thumb = None;
+    match image::ImageReader::new(std::io::Cursor::new(&png[..])).with_guessed_format() {
+        Ok(reader) => {
+            if let Ok((w, h)) = reader.into_dimensions() {
+                width = w;
+                height = h;
+            }
+        }
+        Err(e) => log::debug!("image header read failed: {e}"),
+    }
+    if (width as u64) * (height as u64) <= MAX_THUMB_PIXELS {
+        match image::load_from_memory(&png) {
+            Ok(img) => {
+                if width == 0 {
+                    width = img.width();
+                    height = img.height();
+                }
+                let t = if width > THUMB_MAX || height > THUMB_MAX { img.thumbnail(THUMB_MAX, THUMB_MAX) } else { img };
+                if t.save_with_format(&thumb_path, image::ImageFormat::Png).is_ok() {
+                    thumb = Some(thumb_path);
+                }
+            }
+            Err(e) => log::warn!("image decode failed, keeping original without thumbnail: {e}"),
+        }
+    }
+    Ok(StoredImage { image_path, thumb_path: thumb, width, height, byte_size })
 }
 
 /// Stores the frontmost app's icon once so cards can show it.

@@ -80,9 +80,19 @@ pub fn read() -> Snapshot {
         let has_png = has_type(&types, &png_t.to_string());
         let has_tiff = has_type(&types, &tiff_t.to_string());
         let has_string = has_type(&types, &string_t.to_string());
-        // Prefer text when both exist (e.g. copying from a browser with an image + text).
-        // Apps copying pure images usually provide no string type.
-        if (has_png || has_tiff) && !has_string {
+        // Some apps put a short caption (image URL / file name) next to the bitmap; in that
+        // case the bitmap is what the user wanted. Real text selections are longer or contain
+        // whitespace and win over an incidental image.
+        let string_is_caption = has_string
+            && pb
+                .stringForType(string_t)
+                .map(|s| {
+                    let s = s.to_string();
+                    let t = s.trim();
+                    t.len() < 2048 && (crate::util::looks_like_url(t) || !t.contains(char::is_whitespace))
+                })
+                .unwrap_or(false);
+        if (has_png || has_tiff) && (!has_string || string_is_caption) {
             if has_png {
                 if let Some(d) = pb.dataForType(png_t) {
                     content = Some(Content::Image { data: d.to_vec(), is_png: true });
@@ -149,14 +159,17 @@ pub fn write(item: WriteItem, marker_id: i64) -> isize {
         }
         WriteItem::Image { png } => {
             pb.setData_forType(Some(&NSData::with_bytes(png)), unsafe { NSPasteboardTypePNG });
-            if let Some(tiff) = png_to_tiff(png) {
-                pb.setData_forType(Some(&NSData::with_bytes(&tiff)), unsafe { NSPasteboardTypeTIFF });
+            // TIFF is only needed by a few legacy apps; converting large images would stall pasting.
+            if png.len() <= 3 * 1024 * 1024 {
+                if let Some(tiff) = png_to_tiff(png) {
+                    pb.setData_forType(Some(&NSData::with_bytes(&tiff)), unsafe { NSPasteboardTypeTIFF });
+                }
             }
         }
         WriteItem::Files(paths) => {
-            let urls: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> = paths
+            let existing: Vec<&PathBuf> = paths.iter().filter(|p| p.exists()).collect();
+            let urls: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> = existing
                 .iter()
-                .filter(|p| p.exists())
                 .map(|p| {
                     let url = NSURL::fileURLWithPath(&NSString::from_str(&p.to_string_lossy()));
                     ProtocolObject::from_retained(url)
@@ -166,7 +179,7 @@ pub fn write(item: WriteItem, marker_id: i64) -> isize {
                 let arr = NSArray::from_retained_slice(&urls);
                 pb.writeObjects(&arr);
             }
-            let names: Vec<String> = paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+            let names: Vec<String> = existing.iter().map(|p| p.to_string_lossy().to_string()).collect();
             pb.setString_forType(&NSString::from_str(&names.join("\n")), unsafe { NSPasteboardTypeString });
         }
     }

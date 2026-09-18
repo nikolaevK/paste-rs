@@ -36,10 +36,26 @@ pub fn set_enabled(enabled: bool) -> anyhow::Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&path, plist)?;
+        launchctl(&["bootstrap", &domain(), &path.to_string_lossy()]);
     } else if path.exists() {
+        launchctl(&["bootout", &format!("{}/{LABEL}", domain())]);
         std::fs::remove_file(&path)?;
     }
     Ok(())
+}
+
+fn domain() -> String {
+    format!("gui/{}", unsafe { libc::getuid() })
+}
+
+fn launchctl(args: &[&str]) {
+    match std::process::Command::new("/bin/launchctl").args(args).output() {
+        Ok(out) if !out.status.success() => {
+            log::debug!("launchctl {:?}: {}", args, String::from_utf8_lossy(&out.stderr).trim())
+        }
+        Err(e) => log::debug!("launchctl {:?} failed: {e}", args),
+        _ => {}
+    }
 }
 
 fn xml_escape(s: &str) -> String {

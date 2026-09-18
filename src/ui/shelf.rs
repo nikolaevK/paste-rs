@@ -36,6 +36,8 @@ enum MenuTarget {
 struct MenuState {
     target: MenuTarget,
     position: Point<Pixels>,
+    /// Keyboard-highlighted entry.
+    cursor: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -64,7 +66,7 @@ struct MenuEntry {
 
 #[derive(Clone)]
 pub struct DragItem {
-    pub id: i64,
+    pub ids: Vec<i64>,
 }
 
 enum Editing {
@@ -135,7 +137,12 @@ impl Shelf {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         cx.observe_window_activation(window, |this, window, cx| {
-            if !window.is_window_active() && this.shown && !this.suppress_hide {
+            let active = window.is_window_active();
+            if active && cx.global::<Core>().preview.is_some() {
+                // The user clicked back on the shelf while the preview was open: dismiss the preview.
+                this.close_preview(cx);
+            }
+            if !active && this.shown && !this.suppress_hide {
                 this.hide(window, cx);
             }
         })
@@ -184,6 +191,11 @@ impl Shelf {
     // ---------- data ----------
 
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        if let Tab::Pinboard(id) = self.tab {
+            if !cx.global::<Core>().pinboards.iter().any(|p| p.id == id) {
+                self.tab = Tab::History;
+            }
+        }
         let core = cx.global::<Core>();
         let source: Vec<Arc<ClipItem>> = match self.tab {
             Tab::History => core.history.clone(),
@@ -221,15 +233,33 @@ impl Shelf {
             return;
         }
         let keep_id = self.visible.get(self.selected).map(|i| i.id);
+        let anchor_id = self.visible.get(self.anchor).map(|i| i.id);
+        let multi_ids: Vec<i64> = self.multi.iter().filter_map(|&i| self.visible.get(i).map(|x| x.id)).collect();
         self.refresh(cx);
-        // Keep the same logical item selected when the list shifts (a new item arrived on top).
+        // Keep the same logical items selected when the list shifts (a new item arrived on top).
+        let pos_of = |id: i64, v: &[Arc<ClipItem>]| v.iter().position(|i| i.id == id);
         if let Some(id) = keep_id {
-            if self.tab == Tab::History && self.selected != 0 {
-                if let Some(pos) = self.visible.iter().position(|i| i.id == id) {
+            if self.selected != 0 {
+                if let Some(pos) = pos_of(id, &self.visible) {
                     self.selected = pos;
                 }
             }
         }
+        if let Some(id) = anchor_id {
+            if let Some(pos) = pos_of(id, &self.visible) {
+                self.anchor = pos;
+            }
+        }
+        if !multi_ids.is_empty() {
+            self.multi = multi_ids.iter().filter_map(|&id| pos_of(id, &self.visible)).collect();
+            if self.multi.len() <= 1 {
+                self.multi.clear();
+            }
+        }
+    }
+
+    fn selected_ids(&self) -> Vec<i64> {
+        self.selected_items().iter().map(|i| i.id).collect()
     }
 
     fn current_item(&self) -> Option<Arc<ClipItem>> {
@@ -258,9 +288,8 @@ impl Shelf {
     pub fn show(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let own_pid = cx.global::<Core>().own_pid;
         if let Some(front) = mac::workspace::frontmost_app() {
-            if front.pid != own_pid {
-                cx.global_mut::<Core>().front_app = Some(front);
-            }
+            // If Paste itself is frontmost (e.g. Settings is focused) there is no paste target.
+            cx.global_mut::<Core>().front_app = if front.pid != own_pid { Some(front) } else { None };
         }
         let screen = mac::screen::screen_under_mouse();
         let win = self.ns_window.clone();
@@ -305,6 +334,7 @@ impl Shelf {
         }
         self.shown = false;
         self.menu = None;
+        self.editing = Editing::None;
         self.confirm_clear = false;
         self.close_preview(cx);
         let win = self.ns_window.clone();
@@ -420,10 +450,14 @@ impl Shelf {
             }
             if self.multi.contains(&idx) && self.multi.len() > 1 {
                 self.multi.remove(&idx);
+                self.selected = *self.multi.iter().next_back().unwrap_or(&idx);
+                if self.multi.len() == 1 {
+                    self.multi.clear();
+                }
             } else {
                 self.multi.insert(idx);
+                self.selected = idx;
             }
-            self.selected = idx;
         } else if extend {
             let (a, b) = if self.anchor <= idx { (self.anchor, idx) } else { (idx, self.anchor) };
             self.multi = (a..=b).collect();
@@ -458,6 +492,7 @@ impl Shelf {
     }
 
     fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        self.editing = Editing::None;
         if self.tab != tab {
             self.tab = tab;
             self.selected = 0;
@@ -484,6 +519,11 @@ impl Shelf {
             return None;
         }
         let marker = items[0].id;
+        // clearContents bumps the change count immediately; claim it before writing so the
+        // monitor never sees a half-written pasteboard as an external copy.
+        core.monitor
+            .own_change
+            .store(mac::pasteboard::change_count() + 1, std::sync::atomic::Ordering::Relaxed);
         if items.len() == 1 {
             let item = &items[0];
             let payload = db.payload(item.id).ok()?;
@@ -550,14 +590,20 @@ impl Shelf {
                 core.ax_prompted = true;
                 mac::paste::accessibility_trusted(true);
             }
+            // Keep the shelf open so the explanation is actually visible.
             self.toast("Copied — grant Accessibility access to paste directly", cx);
+            if self.tab == Tab::History {
+                self.refresh(cx);
+            }
+            return;
+        }
+        if front.is_none() {
+            self.toast("Copied", cx);
+            return;
         }
         self.hide(window, cx);
         if self.tab == Tab::History {
             self.refresh(cx);
-        }
-        if !trusted {
-            return;
         }
         cx.spawn(async move |_, cx| {
             cx.background_executor().timer(Duration::from_millis(50)).await;
@@ -579,10 +625,11 @@ impl Shelf {
         }
         if let Some(count) = self.write_items_to_pasteboard(&items, false, cx) {
             self.after_write(&items, count, cx);
-            self.toast("Copied", cx);
             let close = cx.global::<Core>().settings.read().unwrap().close_after_paste;
             if close {
                 self.hide(window, cx);
+            } else {
+                self.toast("Copied", cx);
             }
             self.refresh(cx);
         }
@@ -615,7 +662,7 @@ impl Shelf {
         {
             let core = cx.global_mut::<Core>();
             for item in &items {
-                if item.pinboard_id == Some(pinboard_id) {
+                if core.is_pinned_in(pinboard_id, &item.hash) {
                     continue;
                 }
                 if core.pin_item(item.id, pinboard_id).is_ok() {
@@ -717,11 +764,33 @@ impl Shelf {
         let m = ks.modifiers;
         let key = ks.key.as_str();
 
-        if self.menu.is_some() {
-            if key == "escape" {
-                self.menu = None;
-                cx.notify();
+        if let Some(menu) = &self.menu {
+            let entries = self.menu_entries(&menu.target, cx);
+            match key {
+                "escape" => self.menu = None,
+                "down" | "up" => {
+                    let n = entries.len();
+                    if n > 0 {
+                        let cur = menu.cursor;
+                        let next = match (key == "down", cur) {
+                            (true, None) => 0,
+                            (true, Some(c)) => (c + 1) % n,
+                            (false, None) => n - 1,
+                            (false, Some(c)) => (c + n - 1) % n,
+                        };
+                        if let Some(m) = &mut self.menu {
+                            m.cursor = Some(next);
+                        }
+                    }
+                }
+                "enter" | "space" => {
+                    if let Some(action) = menu.cursor.and_then(|c| entries.get(c)).map(|e| e.action.clone()) {
+                        self.run_menu_action(action, window, cx);
+                    }
+                }
+                _ => {}
             }
+            cx.notify();
             return;
         }
 
@@ -800,7 +869,7 @@ impl Shelf {
                 }
             }
             "space" => {
-                if typing && !m.platform {
+                if !self.query.trim().is_empty() && !m.platform {
                     self.query.push(' ');
                     self.refresh(cx);
                 } else {
@@ -808,14 +877,22 @@ impl Shelf {
                 }
             }
             "backspace" => {
-                if m.platform && !typing {
-                    self.delete_selected(cx);
-                } else if typing {
-                    self.query.pop();
-                    if self.query.is_empty() {
-                        self.search_active = true;
+                if m.platform {
+                    if typing {
+                        self.query.clear();
+                        self.search_active = false;
+                        self.refresh(cx);
+                    } else {
+                        self.delete_selected(cx);
                     }
-                    self.refresh(cx);
+                } else if typing {
+                    if self.query.is_empty() {
+                        self.search_active = false;
+                        cx.notify();
+                    } else {
+                        self.query.pop();
+                        self.refresh(cx);
+                    }
                 }
             }
             "delete" => {
@@ -836,10 +913,15 @@ impl Shelf {
                 }
                 "c" => self.copy_selected(window, cx),
                 "p" => {
-                    if let Some(item) = self.current_item() {
-                        let pos = window.mouse_position();
-                        let _ = item;
-                        self.menu = Some(MenuState { target: MenuTarget::Item(self.selected), position: pos });
+                    if self.current_item().is_some() {
+                        let off = -f32::from(self.scroll.offset().x);
+                        let x = PAD_X + self.selected as f32 * STRIDE - off + 24.0;
+                        let y = TOPBAR_H + STRIP_TOP + 60.0;
+                        self.menu = Some(MenuState {
+                            target: MenuTarget::Item(self.selected),
+                            position: point(px(x.max(8.0)), px(y)),
+                            cursor: Some(0),
+                        });
                         cx.notify();
                     }
                 }
@@ -967,7 +1049,7 @@ impl Shelf {
                 }
                 let mut first = true;
                 for pb in &core.pinboards {
-                    if item.map(|i| i.pinboard_id == Some(pb.id)).unwrap_or(false) {
+                    if item.map(|i| core.is_pinned_in(pb.id, &i.hash)).unwrap_or(false) {
                         continue;
                     }
                     out.push(MenuEntry {
@@ -980,7 +1062,14 @@ impl Shelf {
                     first = false;
                 }
                 out.push(entry("Add to New Pinboard…", MenuAction::NewPinboardWith, first, None));
-                out.push(entry(if multi { "Delete Selected" } else { "Delete" }, MenuAction::Delete, true, Some("⌘⌫")));
+                let pinned = item.map(|i| i.pinboard_id.is_some()).unwrap_or(false);
+                let label = match (multi, pinned) {
+                    (true, true) => "Remove Selected from Pinboard",
+                    (true, false) => "Delete Selected",
+                    (false, true) => "Remove from Pinboard",
+                    (false, false) => "Delete",
+                };
+                out.push(entry(label, MenuAction::Delete, true, Some("⌘⌫")));
             }
             MenuTarget::Pinboard(id) => {
                 out.push(entry("Rename Pinboard…", MenuAction::RenamePinboard(*id), false, None));
@@ -1035,16 +1124,15 @@ impl Shelf {
     }
 
     fn on_pill_drop(&mut self, pinboard_id: i64, drag: &DragItem, cx: &mut Context<Self>) {
-        let already = cx
-            .global::<Core>()
-            .pinned
-            .get(&pinboard_id)
-            .map(|l| l.iter().any(|i| i.id == drag.id))
-            .unwrap_or(false);
-        if already {
-            return;
+        let mut ok = false;
+        for &id in &drag.ids {
+            let hash = cx.global::<Core>().db.get(id).ok().flatten().map(|i| i.hash);
+            let already = hash.as_ref().map(|h| cx.global::<Core>().is_pinned_in(pinboard_id, h)).unwrap_or(true);
+            if already {
+                continue;
+            }
+            ok |= cx.global_mut::<Core>().pin_item(id, pinboard_id).is_ok();
         }
-        let ok = cx.global_mut::<Core>().pin_item(drag.id, pinboard_id).is_ok();
         if ok {
             let name = cx.global::<Core>().pinboards.iter().find(|p| p.id == pinboard_id).map(|p| p.name.clone()).unwrap_or_default();
             self.toast(format!("Added to {name}"), cx);
@@ -1250,7 +1338,7 @@ impl Shelf {
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                        this.menu = Some(MenuState { target: MenuTarget::Pinboard(id), position: ev.position });
+                        this.menu = Some(MenuState { target: MenuTarget::Pinboard(id), position: ev.position, cursor: None });
                         cx.notify();
                     }),
                 )
@@ -1293,12 +1381,15 @@ impl Shelf {
         let hovered = self.hovered;
         let sel = self.selected;
         let multi = self.multi.clone();
+        let selected_ids = self.selected_ids();
 
         let mut icons: Vec<AppIcon> = Vec::with_capacity(last - first);
+        let mut pending: Vec<bool> = Vec::with_capacity(last - first);
         {
             let core = cx.global_mut::<Core>();
             for item in &self.visible[first..last] {
                 icons.push(core.icon_for(&item.app_bundle));
+                pending.push(item.kind == ItemKind::Link && item.link_image_path.is_none() && core.is_link_pending(item.id));
             }
         }
 
@@ -1313,18 +1404,7 @@ impl Shelf {
             .px(px(PAD_X))
             .gap(px(CARD_GAP))
             .overflow_x_scroll()
-            .track_scroll(&self.scroll)
-            .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, window, cx| {
-                let d = ev.delta.pixel_delta(window.line_height());
-                if f32::from(d.y).abs() > f32::from(d.x).abs() {
-                    let view_w = this.view_width(window);
-                    let max = (this.visible.len() as f32 * STRIDE - CARD_GAP - view_w).max(0.0);
-                    let cur = f32::from(this.scroll.offset().x);
-                    let next = (cur + f32::from(d.y)).clamp(-max, 0.0);
-                    this.scroll.set_offset(point(px(next), px(0.)));
-                    cx.notify();
-                }
-            }));
+            .track_scroll(&self.scroll);
 
         if left_w > 0.0 {
             strip = strip.child(div().w(px(left_w - CARD_GAP)).h(px(1.)).flex_shrink_0());
@@ -1335,7 +1415,7 @@ impl Shelf {
             let item_arc = item.clone();
             let tint = icons[i].tint;
             let label: SharedString = format!("{} · {}", item.kind.label(), crate::ui::card::caption(item)).into();
-            let card = render_card(idx, item, &icons[i], theme, is_sel, hovered == Some(idx), now)
+            let card = render_card(idx, item, &icons[i], theme, is_sel, hovered == Some(idx), now, pending[i])
                 .on_hover(cx.listener(move |this, is_hover: &bool, _, cx| {
                     let next = if *is_hover { Some(idx) } else if this.hovered == Some(idx) { None } else { this.hovered };
                     if next != this.hovered {
@@ -1360,13 +1440,16 @@ impl Shelf {
                         } else {
                             this.selected = idx;
                         }
-                        this.menu = Some(MenuState { target: MenuTarget::Item(idx), position: ev.position });
+                        this.menu = Some(MenuState { target: MenuTarget::Item(idx), position: ev.position, cursor: None });
                         cx.notify();
                     }),
                 )
-                .on_drag(DragItem { id: item_arc.id }, move |_, _, _, cx| {
-                    cx.new(|_| DragGhost { label: label.clone(), tint })
-                });
+                .on_drag(
+                    DragItem { ids: if is_sel && selected_ids.len() > 1 { selected_ids.clone() } else { vec![item_arc.id] } },
+                    move |_, _, _, cx| {
+                        cx.new(|_| DragGhost { label: label.clone(), tint })
+                    },
+                );
             strip = strip.child(card);
         }
         if right_w > 0.0 {
@@ -1377,6 +1460,7 @@ impl Shelf {
 
     fn render_menu(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let menu = self.menu.as_ref()?;
+        let cursor = menu.cursor;
         let entries = self.menu_entries(&menu.target, cx);
         let mut list = div()
             .id("context-menu")
@@ -1413,6 +1497,7 @@ impl Shelf {
                     .text_size(px(13.))
                     .text_color(theme.text)
                     .cursor_pointer()
+                    .when(cursor == Some(i), |d| d.bg(hover_bg).text_color(white()))
                     .hover(move |s| s.bg(hover_bg).text_color(white()))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();

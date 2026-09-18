@@ -43,7 +43,22 @@ pub fn is_pid_active(pid: i32) -> bool {
         .unwrap_or(false)
 }
 
+/// Converts any image data AppKit can read (TIFF, HEIC, JPEG, …) to PNG bytes.
+pub fn data_to_png(data: &[u8]) -> Option<Vec<u8>> {
+    objc2::rc::autoreleasepool(|_| {
+        let ns = objc2_foundation::NSData::with_bytes(data);
+        let rep = NSBitmapImageRep::imageRepWithData(&ns)?;
+        let props: Retained<NSDictionary<_, _>> = NSDictionary::new();
+        let out = unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &props) }?;
+        Some(out.to_vec())
+    })
+}
+
 fn image_to_png(image: &NSImage, target_px: usize) -> Option<Vec<u8>> {
+    objc2::rc::autoreleasepool(|_| image_to_png_inner(image, target_px))
+}
+
+fn image_to_png_inner(image: &NSImage, target_px: usize) -> Option<Vec<u8>> {
     let tiff = image.TIFFRepresentation()?;
     let reps = NSBitmapImageRep::imageRepsWithData(&tiff);
     let mut best: Option<Retained<NSBitmapImageRep>> = None;

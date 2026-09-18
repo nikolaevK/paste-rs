@@ -100,6 +100,7 @@ pub fn data_dir() -> PathBuf {
     let _ = std::fs::create_dir_all(dir.join("thumbs"));
     let _ = std::fs::create_dir_all(dir.join("icons"));
     let _ = std::fs::create_dir_all(dir.join("favicons"));
+    let _ = std::fs::create_dir_all(dir.join("link-images"));
     dir
 }
 
@@ -119,10 +120,13 @@ impl Settings {
     }
 
     pub fn save(&self) {
-        if let Ok(json) = serde_json::to_vec_pretty(self) {
-            if let Err(e) = std::fs::write(settings_path(), json) {
-                log::error!("failed to save settings: {e}");
-            }
+        let Ok(json) = serde_json::to_vec_pretty(self) else { return };
+        let path = settings_path();
+        let tmp = path.with_extension("json.tmp");
+        let result = std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, &path));
+        if let Err(e) = result {
+            log::error!("failed to save settings: {e}");
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 

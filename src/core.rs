@@ -11,7 +11,7 @@ use crate::ui::prefs::Prefs;
 use crate::ui::shelf::Shelf;
 use anyhow::Result;
 use gpui::{hsla, Global, Hsla, WindowHandle};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -37,6 +37,8 @@ pub struct Core {
     pub tray: Option<Tray>,
     pub ax_prompted: bool,
     pub own_pid: i32,
+    /// Link items whose title/image fetch is still running (cards show a loading placeholder).
+    pub pending_links: HashSet<i64>,
 }
 
 impl Global for Core {}
@@ -65,6 +67,7 @@ impl Core {
             tray: None,
             ax_prompted: false,
             own_pid: std::process::id() as i32,
+            pending_links: HashSet::new(),
         })
     }
 
@@ -95,12 +98,22 @@ impl Core {
             return icon.clone();
         }
         let icon = load_icon(bundle);
-        self.icons.insert(bundle.to_string(), icon.clone());
+        if icon.path.is_some() || bundle.is_empty() {
+            // Only cache hits; the monitor may write the icon file a moment later.
+            self.icons.insert(bundle.to_string(), icon.clone());
+        }
         icon
     }
 
     pub fn add_item(&mut self, item: ClipItem) {
+        if item.kind == ItemKind::Link && self.settings.read().unwrap().fetch_link_previews {
+            self.pending_links.insert(item.id);
+        }
         self.history.insert(0, Arc::new(item));
+    }
+
+    pub fn is_link_pending(&self, id: i64) -> bool {
+        self.pending_links.contains(&id)
     }
 
     pub fn touch_item(&mut self, id: i64, created_at: i64) {
@@ -111,7 +124,8 @@ impl Core {
         }
     }
 
-    pub fn apply_link_meta(&mut self, id: i64, title: Option<String>, favicon: Option<PathBuf>) {
+    pub fn apply_link_meta(&mut self, id: i64, title: Option<String>, favicon: Option<PathBuf>, image: Option<PathBuf>) {
+        self.pending_links.remove(&id);
         let hash = self.history.iter().find(|i| i.id == id).map(|i| i.hash.clone());
         let update = |item: &mut Arc<ClipItem>| {
             let mut copy = (**item).clone();
@@ -120,6 +134,9 @@ impl Core {
             }
             if favicon.is_some() {
                 copy.favicon_path = favicon.clone();
+            }
+            if image.is_some() {
+                copy.link_image_path = image.clone();
             }
             *item = Arc::new(copy);
         };
@@ -144,6 +161,11 @@ impl Core {
             list.retain(|i| i.id != id);
         }
         Ok(())
+    }
+
+    /// True when an item with this content hash already lives in the pinboard.
+    pub fn is_pinned_in(&self, pinboard_id: i64, hash: &str) -> bool {
+        self.pinned.get(&pinboard_id).map(|l| l.iter().any(|i| i.hash == hash)).unwrap_or(false)
     }
 
     pub fn pin_item(&mut self, id: i64, pinboard_id: i64) -> Result<()> {
@@ -193,14 +215,21 @@ impl Core {
         let retention = self.settings.read().unwrap().retention;
         if let Some(ms) = retention.millis() {
             let cutoff = crate::db::now_ms() - ms;
-            match self.db.purge_older_than(cutoff) {
-                Ok(n) if n > 0 => {
-                    log::info!("purged {n} expired items");
-                    self.history.retain(|i| i.created_at >= cutoff);
-                }
-                Err(e) => log::warn!("purge failed: {e}"),
-                _ => {}
+            let before = self.history.len();
+            self.history.retain(|i| i.created_at >= cutoff);
+            if before != self.history.len() {
+                log::info!("purging {} expired items", before - self.history.len());
             }
+            // The database work (and file removal) runs off the UI thread.
+            let db = self.db.clone();
+            std::thread::Builder::new()
+                .name("purge".into())
+                .spawn(move || {
+                    if let Err(e) = db.purge_older_than(cutoff) {
+                        log::warn!("purge failed: {e}");
+                    }
+                })
+                .ok();
         }
     }
 
@@ -231,7 +260,7 @@ fn fallback_tint(bundle: &str) -> Hsla {
     for b in bundle.bytes() {
         h = (h ^ b as u32).wrapping_mul(16777619);
     }
-    hsla((h % 360) as f32 / 360.0, 0.62, 0.5, 1.0)
+    hsla((h % 360) as f32 / 360.0, 0.62, 0.47, 1.0)
 }
 
 /// Picks a vivid representative color from an app icon for the card header.
@@ -277,8 +306,10 @@ fn dominant_tint(path: &PathBuf) -> Option<Hsla> {
         return Some(hsla(0.6, 0.06, (l * 0.5 + 0.28).clamp(0.3, 0.55), 1.0));
     }
     let h = best.0 / best.3;
-    let s = (best.1 / best.3).clamp(0.5, 0.9);
-    let l = (best.2 / best.3).clamp(0.42, 0.6);
+    let s = (best.1 / best.3).clamp(0.5, 0.88);
+    // Keep headers dark enough for white text; yellow/green hues are perceptually brighter.
+    let max_l = if (0.09..0.5).contains(&h) { 0.44 } else { 0.52 };
+    let l = (best.2 / best.3).clamp(0.38, max_l);
     Some(hsla(h, s, l, 1.0))
 }
 

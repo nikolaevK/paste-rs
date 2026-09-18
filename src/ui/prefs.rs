@@ -111,31 +111,57 @@ fn open_prefs_window(cx: &mut App) {
     }
 }
 
+/// Shifted US-layout symbols reported by AppKit → base key, so the hotkey stays registrable.
+fn unshift(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "~" => "`", "!" => "1", "@" => "2", "#" => "3", "$" => "4", "%" => "5", "^" => "6", "&" => "7",
+        "*" => "8", "(" => "9", ")" => "0", "_" => "-", "+" => "=", "{" => "[", "}" => "]", "|" => "\\",
+        ":" => ";", "\"" => "'", "<" => ",", ">" => ".", "?" => "/",
+        _ => return None,
+    })
+}
+
+fn is_function_key(key: &str) -> bool {
+    key.strip_prefix('f').and_then(|n| n.parse::<u8>().ok()).map(|n| (1..=20).contains(&n)).unwrap_or(false)
+}
+
 fn keystroke_string(ks: &Keystroke) -> String {
     let mut parts = Vec::new();
+    let (key, shifted) = match unshift(&ks.key) {
+        Some(base) => (base.to_string(), true),
+        None => (ks.key.clone(), false),
+    };
     if ks.modifiers.control {
         parts.push("ctrl");
     }
     if ks.modifiers.alt {
         parts.push("alt");
     }
-    if ks.modifiers.shift {
+    if ks.modifiers.shift || shifted {
         parts.push("shift");
     }
     if ks.modifiers.platform {
         parts.push("cmd");
     }
-    parts.push(ks.key.as_str());
+    parts.push(key.as_str());
     parts.join("-")
 }
 
 impl Prefs {
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if !self.recording {
-            if event.keystroke.key == "w" && event.keystroke.modifiers.platform {
-                if let Some(h) = cx.global_mut::<Core>().prefs.take() {
-                    let _ = h.update(cx, |_, window, _| window.remove_window());
+            let ks = &event.keystroke;
+            match ks.key.as_str() {
+                "w" if ks.modifiers.platform => {
+                    cx.global_mut::<Core>().prefs = None;
+                    window.remove_window();
                 }
+                "escape" => {
+                    cx.global_mut::<Core>().prefs = None;
+                    window.remove_window();
+                }
+                "q" if ks.modifiers.platform => cx.quit(),
+                _ => {}
             }
             return;
         }
@@ -149,8 +175,8 @@ impl Prefs {
         if is_modifier_only {
             return;
         }
-        if !(ks.modifiers.platform || ks.modifiers.control || ks.modifiers.alt) {
-            self.hotkey_error = Some("Include ⌘, ⌃ or ⌥ in the shortcut".into());
+        if !(ks.modifiers.platform || ks.modifiers.control || ks.modifiers.alt || is_function_key(&ks.key)) {
+            self.hotkey_error = Some("Include ⌘, ⌃ or ⌥ in the shortcut (or use a function key)".into());
             cx.notify();
             return;
         }
@@ -260,6 +286,7 @@ impl Prefs {
                     if let Some(shelf) = cx.global::<Core>().shelf {
                         let _ = shelf.update(cx, |s, _, cx| s.refresh(cx));
                     }
+                    cx.refresh_windows();
                 }),
                 theme,
             ))

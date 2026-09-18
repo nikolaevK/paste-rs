@@ -1,9 +1,11 @@
-use std::hash::{Hash, Hasher};
-
+/// Stable 64-bit FNV-1a hash (std's DefaultHasher is not guaranteed stable across releases).
 pub fn hash_bytes(bytes: &[u8]) -> String {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut h);
-    format!("{:016x}", h.finish())
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}")
 }
 
 /// Human readable relative time ("3 minutes ago"), in Paste's style.
@@ -84,6 +86,11 @@ pub fn parse_color(text: &str) -> Option<String> {
     }
     if let Some(hex) = s.strip_prefix('#') {
         if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        // "#123" / "#1234" / "#20240917" are far more likely issue numbers or dates than colors.
+        let all_digits = hex.chars().all(|c| c.is_ascii_digit());
+        if all_digits && hex.len() != 6 {
             return None;
         }
         return match hex.len() {
@@ -245,6 +252,10 @@ mod tests {
         assert_eq!(parse_color("hsl(120, 100%, 50%)").as_deref(), Some("#00FF00"));
         assert_eq!(parse_color("hello"), None);
         assert_eq!(parse_color("#12345"), None);
+        assert_eq!(parse_color("#1234"), None);
+        assert_eq!(parse_color("#123"), None);
+        assert_eq!(parse_color("#333333").as_deref(), Some("#333333"));
+        assert_eq!(parse_color("#abc").as_deref(), Some("#AABBCC"));
     }
 
     #[test]

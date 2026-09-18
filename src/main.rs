@@ -43,6 +43,10 @@ fn spawn_control_socket(tx: futures::channel::mpsc::UnboundedSender<AppEvent>) {
             return;
         }
     };
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
     std::thread::Builder::new()
         .name("control-socket".into())
         .spawn(move || {
@@ -123,10 +127,9 @@ fn main() {
             Ok(mut hk) => {
                 let wanted = core.settings().hotkey;
                 if let Err(e) = hk.set(&wanted) {
-                    log::warn!("{e}; falling back to cmd-shift-v");
-                    if hk.set("cmd-shift-v").is_ok() {
-                        core.update_settings(|s| s.hotkey = "cmd-shift-v".into());
-                    }
+                    // Keep the user's choice in settings; use the default for this session only.
+                    log::warn!("{e}; using cmd-shift-v for this session");
+                    let _ = hk.set("cmd-shift-v");
                 }
                 core.hotkeys = Some(hk);
             }
@@ -181,7 +184,7 @@ fn main() {
         install_signal_hooks();
         spawn_control_socket(etx.clone());
         cx.spawn(async move |cx| loop {
-            cx.background_executor().timer(Duration::from_millis(100)).await;
+            cx.background_executor().timer(Duration::from_millis(250)).await;
             let toggle = SIG_TOGGLE.swap(false, std::sync::atomic::Ordering::SeqCst);
             let prefs = SIG_PREFS.swap(false, std::sync::atomic::Ordering::SeqCst);
             if !toggle && !prefs {
@@ -203,7 +206,13 @@ fn main() {
 
         cx.spawn(async move |cx| loop {
             cx.background_executor().timer(Duration::from_secs(3600)).await;
-            if cx.update(|cx| cx.global_mut::<Core>().purge_expired()).is_err() {
+            if cx
+                .update(|cx| {
+                    cx.global_mut::<Core>().purge_expired();
+                    cx.global::<Core>().db.checkpoint();
+                })
+                .is_err()
+            {
                 break;
             }
         })
@@ -227,7 +236,7 @@ fn handle_monitor_event(ev: MonitorEvent, cx: &mut App) {
         match ev {
             MonitorEvent::New(item) => core.add_item(item),
             MonitorEvent::Touched { id, created_at } => core.touch_item(id, created_at),
-            MonitorEvent::LinkMeta { id, title, favicon } => core.apply_link_meta(id, title, favicon),
+            MonitorEvent::LinkMeta { id, title, favicon, image } => core.apply_link_meta(id, title, favicon, image),
         }
     }
     with_shelf(cx, |shelf, _, cx| shelf.on_items_changed(cx));

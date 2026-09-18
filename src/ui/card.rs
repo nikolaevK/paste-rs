@@ -46,7 +46,73 @@ pub fn caption(item: &ClipItem) -> String {
     }
 }
 
-pub fn render_body(item: &ClipItem, theme: &Theme) -> AnyElement {
+/// Neutral block shown while an image decodes (or if it failed to load).
+pub fn image_placeholder(theme: &Theme, icon_name: &'static str, pulse: bool) -> AnyElement {
+    let bg = if theme.dark { hsla(0., 0., 1., 0.06) } else { hsla(0., 0., 0., 0.05) };
+    let base = div()
+        .size_full()
+        .bg(bg)
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(svg().path(icon(icon_name)).size(px(26.)).text_color(theme.text_tertiary));
+    if pulse {
+        base.with_animation(
+            "placeholder-pulse",
+            Animation::new(std::time::Duration::from_millis(1400)).repeat().with_easing(pulsating_between(0.45, 1.0)),
+            |d, t| d.opacity(t),
+        )
+        .into_any_element()
+    } else {
+        base.into_any_element()
+    }
+}
+
+fn link_meta_rows(item: &ClipItem, theme: &Theme, compact: bool) -> Div {
+    let title = item.title.clone().unwrap_or_else(|| item.preview.clone());
+    let domain = item.domain().unwrap_or_default();
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .min_h_0()
+        .overflow_hidden()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.))
+                .child(match &item.favicon_path {
+                    Some(p) => img(p.clone()).size(px(14.)).rounded(px(3.)).flex_shrink_0().into_any_element(),
+                    None => svg().path(icon("link")).size(px(13.)).text_color(theme.text_secondary).flex_shrink_0().into_any_element(),
+                })
+                .child(div().text_size(px(11.)).text_color(theme.text_secondary).truncate().child(SharedString::from(domain))),
+        )
+        .child(
+            div()
+                .text_size(px(12.5))
+                .line_height(px(16.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.text)
+                .line_clamp(if compact { 2 } else { 4 })
+                .overflow_hidden()
+                .child(SharedString::from(title)),
+        )
+        .when(!compact && item.title.is_some(), |d| {
+            d.child(
+                div()
+                    .text_size(px(11.))
+                    .line_height(px(14.))
+                    .text_color(theme.text_tertiary)
+                    .line_clamp(2)
+                    .overflow_hidden()
+                    .child(SharedString::from(item.preview.clone())),
+            )
+        })
+}
+
+pub fn render_body(item: &ClipItem, theme: &Theme, link_pending: bool) -> AnyElement {
     match item.kind {
         ItemKind::Text | ItemKind::RichText => div()
             .size_full()
@@ -58,60 +124,37 @@ pub fn render_body(item: &ClipItem, theme: &Theme) -> AnyElement {
             .child(SharedString::from(item.preview.clone()))
             .into_any_element(),
         ItemKind::Link => {
-            let title = item.title.clone().unwrap_or_else(|| item.preview.clone());
-            let domain = item.domain().unwrap_or_default();
-            div()
-                .size_full()
-                .p(px(12.))
-                .flex()
-                .flex_col()
-                .gap(px(6.))
-                .overflow_hidden()
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(6.))
-                        .child(match &item.favicon_path {
-                            Some(p) => img(p.clone()).size(px(16.)).rounded(px(3.)).flex_shrink_0().into_any_element(),
-                            None => svg()
-                                .path(icon("link"))
-                                .size(px(14.))
-                                .text_color(theme.text_secondary)
-                                .flex_shrink_0()
-                                .into_any_element(),
-                        })
-                        .child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(theme.text_secondary)
-                                .truncate()
-                                .child(SharedString::from(domain)),
+            let t = *theme;
+            if let Some(image) = &item.link_image_path {
+                // Rich preview: image on top, title + domain below (like Paste's link cards).
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(
+                        div().h(px(92.)).w_full().flex_shrink_0().overflow_hidden().child(
+                            img(image.clone())
+                                .size_full()
+                                .object_fit(ObjectFit::Cover)
+                                .with_loading(move || image_placeholder(&t, "image", true))
+                                .with_fallback(move || image_placeholder(&t, "link", false)),
                         ),
-                )
-                .child(
-                    div()
-                        .text_size(px(12.5))
-                        .line_height(px(16.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.text)
-                        .line_clamp(4)
-                        .overflow_hidden()
-                        .child(SharedString::from(title)),
-                )
-                .when(item.title.is_some(), |d| {
-                    d.child(
-                        div()
-                            .text_size(px(11.))
-                            .line_height(px(14.))
-                            .text_color(theme.text_tertiary)
-                            .line_clamp(2)
-                            .overflow_hidden()
-                            .child(SharedString::from(item.preview.clone())),
                     )
-                })
-                .into_any_element()
+                    .child(div().flex_1().min_h_0().px(px(12.)).pt(px(8.)).child(link_meta_rows(item, theme, true)))
+                    .into_any_element()
+            } else if link_pending {
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(div().h(px(92.)).w_full().flex_shrink_0().child(image_placeholder(theme, "link", true)))
+                    .child(div().flex_1().min_h_0().px(px(12.)).pt(px(8.)).child(link_meta_rows(item, theme, true)))
+                    .into_any_element()
+            } else {
+                div().size_full().p(px(12.)).child(link_meta_rows(item, theme, false)).into_any_element()
+            }
         }
         ItemKind::Color => {
             let hex = item.color.clone().unwrap_or_default();
@@ -136,14 +179,20 @@ pub fn render_body(item: &ClipItem, theme: &Theme) -> AnyElement {
                 .into_any_element()
         }
         ItemKind::Image => {
-            let bg = theme.card_bg;
+            let t = *theme;
             match &item.thumb_path {
                 Some(p) => div()
                     .size_full()
-                    .bg(bg)
-                    .child(img(p.clone()).size_full().object_fit(ObjectFit::Cover))
+                    .bg(theme.card_bg)
+                    .child(
+                        img(p.clone())
+                            .size_full()
+                            .object_fit(ObjectFit::Cover)
+                            .with_loading(move || image_placeholder(&t, "image", true))
+                            .with_fallback(move || image_placeholder(&t, "image", false)),
+                    )
                     .into_any_element(),
-                None => div().size_full().bg(bg).into_any_element(),
+                None => image_placeholder(theme, "image", false),
             }
         }
         ItemKind::File => {
@@ -187,6 +236,7 @@ pub fn render_card(
     selected: bool,
     hovered: bool,
     now: i64,
+    link_pending: bool,
 ) -> Stateful<Div> {
     let tint = app_icon.tint;
     let header = div()
@@ -223,7 +273,7 @@ pub fn render_card(
         )
         .child(app_icon_view(app_icon, 24.));
 
-    let body = div().flex_1().min_h_0().w_full().overflow_hidden().child(render_body(item, theme));
+    let body = div().flex_1().min_h_0().w_full().overflow_hidden().child(render_body(item, theme, link_pending));
 
     let footer = div()
         .h(px(FOOTER_H))
