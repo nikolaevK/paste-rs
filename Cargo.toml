@@ -1,0 +1,61 @@
+[package]
+name = "paste"
+version = "0.1.0"
+edition = "2021"
+description = "Native clipboard manager for macOS (Apple Silicon), written in Rust"
+license = "MIT"
+
+[[bin]]
+name = "paste"
+path = "src/main.rs"
+
+[dependencies]
+gpui = { version = "0.2.2", default-features = false, features = ["runtime_shaders", "font-kit"] }
+raw-window-handle = "0.6"
+
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSString", "NSArray", "NSData", "NSURL", "NSDictionary", "NSValue", "NSDate",
+    "NSThread", "NSRunLoop", "NSNotification", "NSEnumerator", "NSRange", "NSGeometry",
+    "NSObjCRuntime", "NSBundle", "NSProcessInfo",
+] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSPasteboard", "NSPasteboardItem", "NSWorkspace", "NSRunningApplication", "NSImage",
+    "NSImageRep", "NSBitmapImageRep", "NSScreen", "NSEvent", "NSApplication", "NSResponder",
+    "NSWindow", "NSView", "NSGraphics", "NSColor", "NSColorSpace",
+] }
+core-graphics = "0.24"
+core-foundation = "0.10"
+libc = "0.2"
+
+rusqlite = { version = "0.40", features = ["bundled"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff", "gif", "bmp", "ico", "webp"] }
+resvg = { version = "0.45", default-features = false }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+dirs = "6"
+futures = "0.3"
+chrono = "0.4"
+regex = "1"
+url = "2"
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+
+global-hotkey = "0.8"
+tray-icon = { version = "0.25", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+debug = false
+strip = true
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
