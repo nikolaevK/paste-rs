@@ -15,18 +15,32 @@ pub struct Preview {
     app_icon: AppIcon,
     focus_handle: FocusHandle,
     scroll: ScrollHandle,
-    closing: bool,
+    pub closing: bool,
+}
+
+/// What the shelf should do once the preview has closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseAction {
+    None,
+    Paste { plain: bool },
+    Copy,
 }
 
 /// Very long texts are cut for the preview; laying out megabytes of text would stall the UI.
 const PREVIEW_TEXT_CHARS: usize = 200_000;
+const SCROLL_LINE: f32 = 42.0;
 
-pub fn open_preview(item: Arc<ClipItem>, app_icon: AppIcon, cx: &mut App) -> anyhow::Result<WindowHandle<Preview>> {
+pub fn load_payload(item: &ClipItem, cx: &App) -> Payload {
     let mut payload = cx.global::<Core>().db.payload(item.id).unwrap_or_default();
     if payload.text.chars().count() > PREVIEW_TEXT_CHARS {
         let cut: String = payload.text.chars().take(PREVIEW_TEXT_CHARS).collect();
         payload.text = format!("{cut}\n\n… (truncated for preview)");
     }
+    payload
+}
+
+pub fn open_preview(item: Arc<ClipItem>, app_icon: AppIcon, cx: &mut App) -> anyhow::Result<WindowHandle<Preview>> {
+    let payload = load_payload(&item, cx);
     let screen = mac::screen::screen_under_mouse().or_else(|| mac::screen::screens().into_iter().next());
     let (sx, sy, sw, sh) = screen.map(|s| (s.x as f32, s.y as f32, s.width as f32, s.height as f32)).unwrap_or((0., 0., 1440., 900.));
     let w = (sw * 0.6).clamp(480., 1100.);
@@ -55,7 +69,7 @@ pub fn open_preview(item: Arc<ClipItem>, app_icon: AppIcon, cx: &mut App) -> any
             let view = cx.new(|cx| {
                 cx.observe_window_activation(window, |this: &mut Preview, window, cx| {
                     if !window.is_window_active() && !this.closing {
-                        this.close(false, window, cx);
+                        this.close(CloseAction::None, window, cx);
                     }
                 })
                 .detach();
@@ -77,7 +91,16 @@ pub fn open_preview(item: Arc<ClipItem>, app_icon: AppIcon, cx: &mut App) -> any
 }
 
 impl Preview {
-    fn close(&mut self, paste: bool, window: &mut Window, cx: &mut Context<Self>) {
+    /// Swaps the previewed item in place (used when browsing with ← → or after a delete).
+    pub fn set_item(&mut self, item: Arc<ClipItem>, payload: Payload, app_icon: AppIcon, cx: &mut Context<Self>) {
+        self.item = item;
+        self.payload = payload;
+        self.app_icon = app_icon;
+        self.scroll.set_offset(point(px(0.), px(0.)));
+        cx.notify();
+    }
+
+    fn close(&mut self, action: CloseAction, window: &mut Window, cx: &mut Context<Self>) {
         if self.closing {
             return;
         }
@@ -86,25 +109,65 @@ impl Preview {
         let shelf = cx.global::<Core>().shelf;
         cx.defer(move |cx| {
             if let Some(shelf) = shelf {
-                let _ = shelf.update(cx, |shelf, window, cx| shelf.on_preview_closed(paste, window, cx));
+                let _ = shelf.update(cx, |shelf, window, cx| shelf.on_preview_closed(action, window, cx));
             }
         });
     }
 
+    fn scroll_by(&mut self, dy: f32, cx: &mut Context<Self>) {
+        // gpui clamps the offset to the content size during layout; only keep it from going above the top.
+        let cur = self.scroll.offset();
+        let next = (f32::from(cur.y) - dy).min(0.0);
+        self.scroll.set_offset(point(cur.x, px(next)));
+        cx.notify();
+    }
+
+    fn navigate(&mut self, delta: i64, cx: &mut Context<Self>) {
+        let Some(shelf) = cx.global::<Core>().shelf else { return };
+        let next = shelf.update(cx, |shelf, window, cx| shelf.preview_navigate(delta, window, cx)).ok().flatten();
+        if let Some((item, payload, icon)) = next {
+            self.set_item(item, payload, icon, cx);
+        }
+    }
+
+    fn delete_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(shelf) = cx.global::<Core>().shelf else { return };
+        let next = shelf.update(cx, |shelf, window, cx| shelf.preview_delete(window, cx)).ok().flatten();
+        match next {
+            Some((item, payload, icon)) => self.set_item(item, payload, icon, cx),
+            None => self.close(CloseAction::None, window, cx),
+        }
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
-        match event.keystroke.key.as_str() {
-            "escape" | "space" => self.close(false, window, cx),
-            "enter" => self.close(true, window, cx),
-            "o" if event.keystroke.modifiers.platform && self.item.kind == ItemKind::Link => {
+        let ks = &event.keystroke;
+        let m = ks.modifiers;
+        let page = f32::from(window.viewport_size().height) * 0.8;
+        match ks.key.as_str() {
+            "escape" | "space" => self.close(CloseAction::None, window, cx),
+            "y" if m.platform => self.close(CloseAction::None, window, cx),
+            "enter" => self.close(CloseAction::Paste { plain: m.shift }, window, cx),
+            "c" if m.platform => self.close(CloseAction::Copy, window, cx),
+            "o" if m.platform && self.item.kind == ItemKind::Link => {
                 mac::workspace::open_url(self.item.preview.trim());
-                self.close(false, window, cx);
+                self.close(CloseAction::None, window, cx);
             }
+            "backspace" if m.platform => self.delete_current(window, cx),
+            "delete" => self.delete_current(window, cx),
+            "left" => self.navigate(-1, cx),
+            "right" => self.navigate(1, cx),
+            "up" => self.scroll_by(-SCROLL_LINE, cx),
+            "down" => self.scroll_by(SCROLL_LINE, cx),
+            "pageup" => self.scroll_by(-page, cx),
+            "pagedown" => self.scroll_by(page, cx),
+            "home" => self.scroll_by(-1e9, cx),
+            "end" => self.scroll_by(1e9, cx),
             _ => {}
         }
     }
 
-    fn render_content(&self, theme: &Theme) -> AnyElement {
+    fn render_content(&self, theme: &Theme, viewport_h: f32) -> AnyElement {
         let item = &self.item;
         match item.kind {
             ItemKind::Image => {
@@ -179,7 +242,8 @@ impl Preview {
                 .gap(px(12.))
                 .children(item.link_image_path.clone().map(|p| {
                     let t = *theme;
-                    div().h(px(260.)).w_full().flex_shrink_0().rounded(px(10.)).overflow_hidden().child(
+                    let h = (viewport_h * 0.42).clamp(120., 360.);
+                    div().h(px(h)).w_full().flex_shrink_0().rounded(px(10.)).overflow_hidden().child(
                         img(p)
                             .size_full()
                             .object_fit(ObjectFit::Cover)
@@ -214,9 +278,10 @@ impl Preview {
                 .track_scroll(&self.scroll)
                 .p(px(24.))
                 .child(
+                    // No explicit line height: gpui measures scroll content with the font's
+                    // default spacing, and a custom value would make the scroll range too short.
                     div()
                         .text_size(px(14.))
-                        .line_height(px(21.))
                         .text_color(theme.text)
                         .child(SharedString::from(self.payload.text.clone())),
                 )
@@ -287,9 +352,17 @@ impl Render for Preview {
                                     )))),
                             )
                             .child(div().flex_1())
-                            .child(div().text_size(px(11.5)).text_color(theme.text_tertiary).child("↩ Paste   Space Close")),
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(theme.text_tertiary)
+                                    .child(match item.kind {
+                                        ItemKind::Text | ItemKind::RichText => "← → Browse   ↑ ↓ Scroll   ↩ Paste   Space Close",
+                                        _ => "← → Browse   ↩ Paste   Space Close",
+                                    }),
+                            ),
                     )
-                    .child(div().flex_1().min_h_0().child(self.render_content(&theme))),
+                    .child(div().flex_1().min_h_0().child(self.render_content(&theme, f32::from(window.viewport_size().height)))),
             )
     }
 }

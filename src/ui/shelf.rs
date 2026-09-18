@@ -95,6 +95,8 @@ pub struct Shelf {
     toast: Option<SharedString>,
     toast_gen: u64,
     confirm_clear: bool,
+    /// True when the last key press was navigation (so Space previews instead of typing a space).
+    last_key_was_nav: bool,
     now: i64,
     _tick: Task<()>,
 }
@@ -181,6 +183,7 @@ impl Shelf {
             toast: None,
             toast_gen: 0,
             confirm_clear: false,
+            last_key_was_nav: false,
             now: now_ms(),
             _tick: tick,
         };
@@ -348,8 +351,9 @@ impl Shelf {
     }
 
     pub fn debug_state(&self) -> String {
+        let ns_visible = self.ns_window.as_ref().map(|w| w.isVisible()).unwrap_or(false);
         format!(
-            "shown={} tab={:?} query={:?} search_active={} visible={} selected={} multi={:?} menu={} editing={} preview_suppress={} scroll_x={}",
+            "ns_visible={ns_visible} shown={} tab={:?} query={:?} search_active={} visible={} selected={} multi={:?} menu={} editing={} preview_suppress={} scroll_x={}",
             self.shown,
             self.tab,
             self.query,
@@ -721,9 +725,40 @@ impl Shelf {
 
     fn close_preview(&mut self, cx: &mut Context<Self>) {
         if let Some(handle) = cx.global_mut::<Core>().preview.take() {
-            let _ = handle.update(cx, |_, window, _| window.remove_window());
+            // Mark it closing first so its own deactivation observer does not call back into us.
+            let _ = handle.update(cx, |preview, window, _| {
+                preview.closing = true;
+                window.remove_window();
+            });
         }
         self.suppress_hide = false;
+    }
+
+    fn preview_bundle(&self, cx: &mut Context<Self>) -> Option<(Arc<ClipItem>, crate::model::Payload, AppIcon)> {
+        let item = self.current_item()?;
+        let payload = crate::ui::preview::load_payload(&item, cx);
+        let icon = cx.global_mut::<Core>().icon_for(&item.app_bundle);
+        Some((item, payload, icon))
+    }
+
+    /// Moves the selection while the preview is open and returns the new item to show.
+    pub fn preview_navigate(&mut self, delta: i64, window: &mut Window, cx: &mut Context<Self>) -> Option<(Arc<ClipItem>, crate::model::Payload, AppIcon)> {
+        if self.visible.is_empty() {
+            return None;
+        }
+        let target = (self.selected as i64 + delta).clamp(0, self.visible.len() as i64 - 1) as usize;
+        if target == self.selected {
+            return None;
+        }
+        self.select(target, false, false, window, cx);
+        self.preview_bundle(cx)
+    }
+
+    /// Deletes the current item from the preview and returns the item that took its place.
+    pub fn preview_delete(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Option<(Arc<ClipItem>, crate::model::Payload, AppIcon)> {
+        self.multi.clear();
+        self.delete_selected(cx);
+        self.preview_bundle(cx)
     }
 
     fn toggle_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -746,14 +781,21 @@ impl Shelf {
     }
 
     /// Called by the preview window when it closes itself.
-    pub fn on_preview_closed(&mut self, paste: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn on_preview_closed(&mut self, action: crate::ui::preview::CloseAction, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::ui::preview::CloseAction;
         cx.global_mut::<Core>().preview = None;
         self.suppress_hide = false;
-        if paste {
-            self.paste_selected(false, window, cx);
-        } else {
-            window.activate_window();
-            window.focus(&self.focus_handle);
+        if !self.shown {
+            // The shelf was hidden while the preview was open; never bring it back.
+            return;
+        }
+        match action {
+            CloseAction::Paste { plain } => self.paste_selected(plain, window, cx),
+            CloseAction::Copy => self.copy_selected(window, cx),
+            CloseAction::None => {
+                window.activate_window();
+                window.focus(&self.focus_handle);
+            }
         }
     }
 
@@ -815,6 +857,8 @@ impl Shelf {
         }
 
         let typing = self.search_active || !self.query.is_empty();
+        let was_nav = self.last_key_was_nav;
+        self.last_key_was_nav = matches!(key, "left" | "right" | "up" | "down" | "home" | "end" | "pageup" | "pagedown" | "tab");
         match key {
             "escape" => {
                 if typing {
@@ -872,7 +916,7 @@ impl Shelf {
                 }
             }
             "space" => {
-                if !self.query.trim().is_empty() && !m.platform {
+                if !self.query.trim().is_empty() && !m.platform && !was_nav {
                     self.query.push(' ');
                     self.refresh(cx);
                 } else {
@@ -915,6 +959,7 @@ impl Shelf {
                     }
                 }
                 "c" => self.copy_selected(window, cx),
+                "y" => self.toggle_preview(window, cx),
                 "p" => {
                     if self.current_item().is_some() {
                         let off = -f32::from(self.scroll.offset().x);

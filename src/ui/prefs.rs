@@ -421,7 +421,7 @@ impl Prefs {
             ("Paste selected item", "↩"),
             ("Paste as plain text", "⇧↩"),
             ("Copy without pasting", "⌥↩ / ⌘C"),
-            ("Quick Look preview", "Space"),
+            ("Quick Look preview", "Space / ⌘Y"),
             ("Search", "Start typing / ⌘F"),
             ("Move between items", "← →"),
             ("Extend selection", "⇧← ⇧→ / ⇧Click"),

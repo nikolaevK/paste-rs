@@ -34,7 +34,7 @@ uses `objc2` bindings to AppKit directly. No Electron, no web view.
 | Move between cards | `←` `→`, `Home`/`End`, `PageUp`/`PageDown` |
 | Extend / toggle selection | `⇧←` `⇧→`, `⇧Click`, `⌘Click`, `⌘A` |
 | Paste / paste plain / copy only | `↩` / `⇧↩` / `⌥↩` or `⌘C` |
-| Quick Look | `Space` |
+| Quick Look | `Space` or `⌘Y` (in the preview: `← →` browse, `↑ ↓` scroll, `↩` paste, `⇧↩` plain, `⌘C` copy, `⌘⌫` delete) |
 | Search | type anything, `⌘F`; `Esc` clears |
 | Switch pinboard | `⇥`, `⇧⇥`, `↑` `↓`, `⌘1…9` |
 | New pinboard / add to pinboard | `⌘N` / `⌘P` or drag onto a tab |

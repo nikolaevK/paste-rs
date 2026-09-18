@@ -97,6 +97,11 @@ pub fn synthesize_key_press(key: &str, cmd: bool, shift: bool) {
         "space" => (49, " ".into(), false),
         "tab" => (48, "\t".into(), false),
         "backspace" => (51, "\u{7f}".into(), false),
+        "delete" => (117, "\u{F728}".into(), true),
+        "home" => (115, "\u{F729}".into(), true),
+        "end" => (119, "\u{F72B}".into(), true),
+        "pageup" => (116, "\u{F72C}".into(), true),
+        "pagedown" => (121, "\u{F72D}".into(), true),
         k => {
             let ch = k.chars().next().unwrap_or('a');
             let code = match ch.to_ascii_lowercase() {
@@ -125,7 +130,7 @@ pub fn synthesize_key_press(key: &str, cmd: bool, shift: bool) {
     };
     let ns_chars = NSString::from_str(&chars);
     for ty in [NSEventType::KeyDown, NSEventType::KeyUp] {
-        let ev = unsafe {
+        let ev = {
             NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
                 ty,
                 NSPoint::new(0.0, 0.0),
